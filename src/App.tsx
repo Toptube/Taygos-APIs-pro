@@ -43,6 +43,7 @@ export default function App() {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [authResolved, setAuthResolved] = useState(false);
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [overview, setOverview] = useState<GatewayOverviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('home');
@@ -137,12 +138,34 @@ export default function App() {
   // Listen for Firebase Auth state (persists automatically across page refresh)
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      setFirebaseUser(user);
       if (user) {
         try {
           const idToken = await user.getIdToken();
+          const statusRes = await fetch('/api/admin/auth/status', {
+            headers: { Authorization: `Bearer ${idToken}` },
+          });
+          const statusData = (await statusRes.json()) as AuthStatusResponse;
+          setAuthStatus(statusData);
+
+          if (!statusData.authenticated) {
+            await signOutFirebase().catch(() => {});
+            syncedUidRef.current = null;
+            setFirebaseUser(null);
+            setAdminToken(null);
+            setAuthError(
+              lang === 'ar'
+                ? `الحساب (${user.email || ''}) غير مصرح له. إدارة Taygos APIs مقتصرة على حساب السوبر أدمن فقط.`
+                : `Account (${user.email || ''}) is not authorized. Only the Super Admin Google account can manage Taygos APIs.`
+            );
+            setLoading(false);
+            setAuthResolved(true);
+            return;
+          }
+
+          setAuthError(null);
+          setFirebaseUser(user);
           setAdminToken(idToken);
-          await fetchAuthStatus(idToken);
+          setLoading(false);
 
           if (syncedUidRef.current !== user.uid) {
             syncedUidRef.current = user.uid;
@@ -165,14 +188,16 @@ export default function App() {
           await fetchOverview(idToken);
         } catch (err) {
           console.error('Cloud vault sync error:', err);
+          setLoading(false);
         }
       } else {
         syncedUidRef.current = null;
+        setFirebaseUser(null);
       }
       setAuthResolved(true);
     });
     return () => unsubscribe();
-  }, [fetchAuthStatus, fetchOverview]);
+  }, [fetchOverview, lang]);
 
   useEffect(() => {
     if (!authResolved) return;
@@ -188,6 +213,7 @@ export default function App() {
   }, [adminToken, firebaseUser, fetchOverview]);
 
   const handleAuthenticated = (token: string) => {
+    setAuthError(null);
     setAdminToken(token);
   };
 
@@ -551,6 +577,7 @@ export default function App() {
         lang={lang}
         onToggleLang={() => setLang((l) => (l === 'ar' ? 'en' : 'ar'))}
         authStatus={authStatus}
+        externalError={authError}
         onAuthenticated={handleAuthenticated}
       />
     );

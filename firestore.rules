@@ -28,7 +28,9 @@ service cloud.firestore {
     }
 
     function isOwner(userId) {
-      return isVerifiedUser() && request.auth.uid == userId;
+      return isVerifiedUser() &&
+        request.auth.uid == userId &&
+        request.auth.token.email == 'sambasuony@gmail.com';
     }
 
     function hasValidUserVaultParent(userId) {
@@ -247,7 +249,9 @@ service cloud.firestore {
     }
 
     match /users/{userId} {
-      allow get: if isOwner(userId) && isValidId(userId) && existing().ownerId == request.auth.uid;
+      allow get: if isOwner(userId) &&
+        isValidId(userId) &&
+        (resource == null || existing().ownerId == request.auth.uid);
       allow list: if false;
       allow create: if isOwner(userId) &&
         isValidId(userId) &&
@@ -267,7 +271,7 @@ service cloud.firestore {
         allow get: if isOwner(userId) &&
           isValidId(userId) &&
           isValidId(keyId) &&
-          existing().ownerId == request.auth.uid;
+          (resource == null || existing().ownerId == request.auth.uid);
         allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
         allow create: if isOwner(userId) &&
           isValidId(userId) &&
@@ -301,7 +305,7 @@ service cloud.firestore {
         allow get: if isOwner(userId) &&
           isValidId(userId) &&
           isValidId(providerId) &&
-          existing().ownerId == request.auth.uid;
+          (resource == null || existing().ownerId == request.auth.uid);
         allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
         allow create: if isOwner(userId) &&
           isValidId(userId) &&
@@ -348,7 +352,7 @@ service cloud.firestore {
         allow get: if isOwner(userId) &&
           isValidId(userId) &&
           settingId == 'routing' &&
-          existing().ownerId == request.auth.uid;
+          (resource == null || existing().ownerId == request.auth.uid);
         allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
         allow create: if isOwner(userId) &&
           isValidId(userId) &&

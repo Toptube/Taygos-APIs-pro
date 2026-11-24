@@ -8,6 +8,7 @@ interface AuthGateProps {
   lang: Language;
   onToggleLang: () => void;
   authStatus: AuthStatusResponse;
+  externalError?: string | null;
   onAuthenticated: (token: string) => void;
 }
 
@@ -15,6 +16,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({
   lang,
   onToggleLang,
   authStatus,
+  externalError,
   onAuthenticated,
 }) => {
   const t = useT(lang);
@@ -116,8 +118,8 @@ export const AuthGate: React.FC<AuthGateProps> = ({
 
         <p className="text-sm text-slate-600 leading-relaxed">
           {lang === 'ar'
-            ? 'سجّل الدخول بحساب Google لحفظ جميع مفاتيحك وإعدادات المزودين في سحابة Firebase Firestore بشكل دائم لا يضيع عند تحديث الصفحة.'
-            : 'Sign in with Google to persist all Taygos access keys and upstream provider credentials permanently in Firebase Firestore.'}
+            ? 'الدخول بحساب Google (السوبر أدمن) يفتح اللوحة مباشرة بدون الحاجة لرمز التحقق مرة أخرى، ويحفظ جميع مفاتيحك ومزوداتك بشكل دائم في Firebase Firestore.'
+            : 'Signing in with the Super Admin Google account unlocks the dashboard directly with permanent Firebase Firestore cloud persistence.'}
         </p>
 
         {firebaseEnabled && (
@@ -133,8 +135,8 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                 {googleSubmitting
                   ? '...'
                   : lang === 'ar'
-                    ? 'تسجيل الدخول بحساب Google (حفظ سحابي دائم)'
-                    : 'Sign in with Google (Cloud Sync)'}
+                    ? 'دخول السوبر أدمن بحساب Google (حفظ سحابي)'
+                    : 'Super Admin Google Sign-In (Cloud Sync)'}
               </span>
             </button>
 
@@ -144,7 +146,9 @@ export const AuthGate: React.FC<AuthGateProps> = ({
               </div>
               <div className="relative flex justify-center text-xs">
                 <span className="bg-white px-2.5 text-slate-400">
-                  {lang === 'ar' ? 'أو الدخول بكلمة مرور الإدارة' : 'Or admin passcode'}
+                  {lang === 'ar'
+                    ? 'أو دخول محلي بديل برمز المسؤول (بدون حفظ سحابي)'
+                    : 'Or local passcode fallback (no cloud sync)'}
                 </span>
               </div>
             </div>
@@ -192,9 +196,9 @@ export const AuthGate: React.FC<AuthGateProps> = ({
             </div>
           )}
 
-          {error && (
+          {(error || externalError) && (
             <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3.5 py-2.5">
-              {error}
+              {error || externalError}
             </div>
           )}
 

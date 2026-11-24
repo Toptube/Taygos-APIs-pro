@@ -8,6 +8,8 @@ interface FirebaseAppletConfig {
   projectId?: string;
 }
 
+const DEFAULT_SUPER_ADMIN_EMAIL = 'sambasuony@gmail.com';
+
 let cachedProjectId: string | null = null;
 let cachedApp: App | null = null;
 
@@ -42,6 +44,14 @@ function getFirebaseAdminAuthApp(): App | null {
   return cachedApp;
 }
 
+function getAllowedAdminEmails(): string[] {
+  const configured = (process.env.TAYGOS_ADMIN_EMAIL || DEFAULT_SUPER_ADMIN_EMAIL)
+    .split(',')
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  return configured.length > 0 ? configured : [DEFAULT_SUPER_ADMIN_EMAIL];
+}
+
 export function isFirebaseAuthConfigured(): boolean {
   return Boolean(loadProjectId());
 }
@@ -59,30 +69,16 @@ export async function verifyFirebaseAdminBearer(
       return null;
     }
 
-    const store = getStore();
-    const bootstrapEmail = (process.env.TAYGOS_ADMIN_EMAIL || 'sambasuony@gmail.com')
-      .trim()
-      .toLowerCase();
     const userEmail = (decoded.email || '').trim().toLowerCase();
-
-    if (!store.adminOwnerUid) {
-      // Allow bootstrap owner email or first verified owner if none claimed yet
-      if (userEmail === bootstrapEmail || !bootstrapEmail) {
-        store.adminOwnerUid = decoded.uid;
-        persistStore();
-      } else {
-        // First verified user if different email in fresh preview? Claim only if bootstrap email isn't strictly locked
-        store.adminOwnerUid = decoded.uid;
-        persistStore();
-      }
+    const allowedEmails = getAllowedAdminEmails();
+    if (!userEmail || !allowedEmails.includes(userEmail)) {
+      return null;
     }
 
-    const isAllowedOwner =
-      decoded.uid === store.adminOwnerUid ||
-      (bootstrapEmail && userEmail === bootstrapEmail);
-
-    if (!isAllowedOwner) {
-      return null;
+    const store = getStore();
+    if (store.adminOwnerUid !== decoded.uid) {
+      store.adminOwnerUid = decoded.uid;
+      persistStore();
     }
 
     return decoded;
