@@ -2,5 +2,7 @@
   "name": "Taygos APIs",
   "description": "Unified API gateway with perpetual public and secret access keys, HMAC request signing, and automatic internal provider failover.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
