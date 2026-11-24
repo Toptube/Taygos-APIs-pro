@@ -17,6 +17,10 @@ import {
   verifyAdminSessionToken,
 } from './server/security.ts';
 import {
+  isFirebaseAuthConfigured,
+  verifyFirebaseAdminBearer,
+} from './server/firebaseAuth.ts';
+import {
   addUpstreamProviderRecord,
   claimInitialAdminPassword,
   getStore,
@@ -25,6 +29,7 @@ import {
   persistStore,
   revealAccessKeySecret,
   rotateAccessKeySecret,
+  syncCloudVaultToStore,
   toPublicKeyView,
   toPublicProviderView,
   verifyAdminPasscode,
@@ -50,13 +55,22 @@ function extractBearerToken(req: Request): string {
   return header.slice(7).trim();
 }
 
-function requireAdminAuth(req: Request, res: Response, next: NextFunction): void {
+async function requireAdminAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
   const token = extractBearerToken(req);
-  if (!verifyAdminSessionToken(token)) {
-    res.status(401).json({ error: 'Unauthorized admin session.' });
+  if (verifyAdminSessionToken(token)) {
+    next();
     return;
   }
-  next();
+  const firebaseUser = await verifyFirebaseAdminBearer(token);
+  if (firebaseUser) {
+    next();
+    return;
+  }
+  res.status(401).json({ error: 'Unauthorized admin session.' });
 }
 
 function getBaseOrigin(req: Request): string {
@@ -472,12 +486,15 @@ async function startServer(): Promise<void> {
   });
 
   // Admin Authentication Routes
-  app.get('/api/admin/auth/status', (req, res) => {
+  app.get('/api/admin/auth/status', async (req, res) => {
     const token = extractBearerToken(req);
+    const authenticated =
+      verifyAdminSessionToken(token) || Boolean(await verifyFirebaseAdminBearer(token));
     res.json({
       requiresSetup: isAdminSetupRequired(),
       envPasscodeActive: isEnvPasscodeConfigured(),
-      authenticated: verifyAdminSessionToken(token),
+      authenticated,
+      firebaseEnabled: isFirebaseAuthConfigured(),
     });
   });
 
@@ -518,6 +535,24 @@ async function startServer(): Promise<void> {
 
   app.post('/api/admin/auth/logout', (_req, res) => {
     res.json({ ok: true });
+  });
+
+  app.post('/api/admin/cloud/sync', requireAdminAuth, async (req, res) => {
+    const body =
+      req.body && typeof req.body === 'object'
+        ? (req.body as Record<string, unknown>)
+        : {};
+    const accessKeys = Array.isArray(body.accessKeys) ? body.accessKeys : [];
+    const providers = Array.isArray(body.providers) ? body.providers : [];
+    const routing =
+      body.routing && typeof body.routing === 'object' ? body.routing : null;
+
+    const result = await syncCloudVaultToStore({
+      accessKeys,
+      providers,
+      routing,
+    });
+    res.json({ ok: true, ...result });
   });
 
   // Protected Admin Routes
@@ -721,7 +756,7 @@ async function startServer(): Promise<void> {
         typeof req.body?.model === 'string' && req.body.model.trim()
           ? req.body.model.trim().slice(0, 80)
           : adapter === 'gemini'
-            ? 'gemini-2.5-flash'
+            ? 'gemini-4-hydrogen'
             : 'default',
       authHeader:
         typeof req.body?.authHeader === 'string' && req.body.authHeader.trim()
@@ -820,7 +855,7 @@ async function startServer(): Promise<void> {
           typeof item?.model === 'string' && item.model.trim()
             ? item.model.trim().slice(0, 80)
             : adapter === 'gemini'
-              ? 'gemini-2.5-flash'
+              ? 'gemini-4-hydrogen'
               : 'default',
         authHeader:
           typeof item?.authHeader === 'string' && item.authHeader.trim()

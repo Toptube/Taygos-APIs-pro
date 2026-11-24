@@ -144,6 +144,7 @@ export interface AuthStatusResponse {
   requiresSetup: boolean;
   envPasscodeActive: boolean;
   authenticated: boolean;
+  firebaseEnabled?: boolean;
 }
 
 export interface CreatedKeySecretResponse {

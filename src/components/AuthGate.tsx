@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { Lock, ShieldCheck, Globe } from 'lucide-react';
-import type { AuthStatusResponse, Language } from '../types/taygos';
+import { Cloud, Globe, Lock, ShieldCheck } from 'lucide-react';
 import { useT } from '../i18n/translations';
+import { signInWithGooglePopup } from '../lib/firebase';
+import type { AuthStatusResponse, Language } from '../types/taygos';
 
 interface AuthGateProps {
   lang: Language;
@@ -21,8 +22,30 @@ export const AuthGate: React.FC<AuthGateProps> = ({
   const [confirm, setConfirm] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [googleSubmitting, setGoogleSubmitting] = useState(false);
 
   const isSetup = authStatus.requiresSetup;
+  const firebaseEnabled = authStatus.firebaseEnabled !== false;
+
+  const handleGoogleSignIn = async () => {
+    setError(null);
+    setGoogleSubmitting(true);
+    try {
+      const user = await signInWithGooglePopup();
+      const idToken = await user.getIdToken();
+      onAuthenticated(idToken);
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : 'Google Sign-In failed or was cancelled.';
+      setError(
+        lang === 'ar'
+          ? `تعذر تسجيل الدخول عبر Google: ${msg}`
+          : `Google Sign-In failed: ${msg}`
+      );
+    } finally {
+      setGoogleSubmitting(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -81,8 +104,8 @@ export const AuthGate: React.FC<AuthGateProps> = ({
         </button>
       </div>
 
-      <div className="max-w-md w-full mx-auto bg-white border border-slate-200 rounded-xl p-8">
-        <div className="flex items-center gap-3 mb-4">
+      <div className="max-w-md w-full mx-auto bg-white border border-slate-200 rounded-xl p-6 sm:p-8 space-y-5">
+        <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-lg bg-teal-50 border border-teal-200 flex items-center justify-center text-teal-700 shrink-0">
             {isSetup ? <ShieldCheck className="w-5 h-5" /> : <Lock className="w-5 h-5" />}
           </div>
@@ -91,12 +114,45 @@ export const AuthGate: React.FC<AuthGateProps> = ({
           </h1>
         </div>
 
-        <p className="text-sm text-slate-600 leading-relaxed mb-6">
-          {isSetup ? t.authSetupDesc : t.authLoginDesc}
+        <p className="text-sm text-slate-600 leading-relaxed">
+          {lang === 'ar'
+            ? 'سجّل الدخول بحساب Google لحفظ جميع مفاتيحك وإعدادات المزودين في سحابة Firebase Firestore بشكل دائم لا يضيع عند تحديث الصفحة.'
+            : 'Sign in with Google to persist all Taygos access keys and upstream provider credentials permanently in Firebase Firestore.'}
         </p>
 
+        {firebaseEnabled && (
+          <div className="space-y-3">
+            <button
+              type="button"
+              onClick={handleGoogleSignIn}
+              disabled={googleSubmitting}
+              className="w-full py-2.5 px-4 text-sm font-semibold text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-60 rounded-lg transition-colors inline-flex items-center justify-center gap-2"
+            >
+              <Cloud className="w-4 h-4" />
+              <span>
+                {googleSubmitting
+                  ? '...'
+                  : lang === 'ar'
+                    ? 'تسجيل الدخول بحساب Google (حفظ سحابي دائم)'
+                    : 'Sign in with Google (Cloud Sync)'}
+              </span>
+            </button>
+
+            <div className="relative py-1">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-slate-200" />
+              </div>
+              <div className="relative flex justify-center text-xs">
+                <span className="bg-white px-2.5 text-slate-400">
+                  {lang === 'ar' ? 'أو الدخول بكلمة مرور الإدارة' : 'Or admin passcode'}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
         {authStatus.envPasscodeActive && (
-          <div className="mb-5 px-3.5 py-2.5 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg">
+          <div className="px-3.5 py-2.5 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg">
             {t.authEnvNotice}
           </div>
         )}
@@ -113,7 +169,6 @@ export const AuthGate: React.FC<AuthGateProps> = ({
               dir="ltr"
               required
               minLength={6}
-              autoFocus
               className="w-full px-3.5 py-2.5 text-sm font-mono bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600 focus:border-teal-600"
               placeholder="••••••••"
             />
@@ -154,7 +209,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({
       </div>
 
       <div className="max-w-md w-full mx-auto text-center text-xs text-slate-500">
-        Taygos APIs · Unified Gateway &amp; Key Control
+        Taygos APIs · Unified Gateway &amp; Cloud Vault
       </div>
     </div>
   );

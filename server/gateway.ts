@@ -155,6 +155,17 @@ export function resolveProviderApiKey(provider: StoredUpstreamProvider): string 
   return unsealSecret(provider.apiKeySealed) ?? '';
 }
 
+function createGeminiClient(apiKey: string): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
 function hasProviderCredentials(provider: StoredUpstreamProvider): boolean {
   if (provider.adapter === 'sandbox-simulator') return true;
   if (
@@ -328,18 +339,62 @@ async function invokeSingleProvider(
       if (!apiKey) {
         throw Object.assign(new Error('Gemini upstream key is missing.'), { statusCode: 401 });
       }
-      const ai = new GoogleGenAI({ apiKey });
-      const imgRes = await ai.models.generateImages({
-        model: provider.model || 'imagen-3.0-generate-002',
-        prompt: cleanPrompt,
-        config: { numberOfImages: 1 },
+      const ai = createGeminiClient(apiKey);
+      const imageModel = provider.model || 'gemini-3.1-flash-lite-image';
+
+      if (payload.__probeOnly === true) {
+        const meta = await ai.models.get({ model: imageModel });
+        return {
+          statusCode: 200,
+          data: {
+            model: meta.name || imageModel,
+            status: 'verified',
+          },
+        };
+      }
+
+      const parts: Array<{ text?: string; inlineData?: { data: string; mimeType: string } }> = [];
+      if (inputImageUrl && inputImageUrl.startsWith('https://')) {
+        const safeImg = await assertSafeUpstreamUrl(inputImageUrl);
+        const imgRes = await fetch(safeImg.toString());
+        if (imgRes.ok) {
+          const buf = Buffer.from(await imgRes.arrayBuffer());
+          parts.push({
+            inlineData: {
+              data: buf.toString('base64'),
+              mimeType: imgRes.headers.get('content-type') || 'image/png',
+            },
+          });
+        }
+      }
+      parts.push({ text: cleanPrompt });
+
+      const response = await ai.models.generateContent({
+        model: imageModel,
+        contents: { parts },
       });
-      const b64 = imgRes.generatedImages?.[0]?.image?.imageBytes;
+
+      const outImages: Array<{ b64_json: string; url: string }> = [];
+      for (const part of response.candidates?.[0]?.content?.parts ?? []) {
+        if (part.inlineData?.data) {
+          const mime = part.inlineData.mimeType || 'image/png';
+          outImages.push({
+            b64_json: part.inlineData.data,
+            url: `data:${mime};base64,${part.inlineData.data}`,
+          });
+        }
+      }
+      if (outImages.length === 0) {
+        throw Object.assign(
+          new Error('Gemini did not return an image part for this prompt/key.'),
+          { statusCode: 502 }
+        );
+      }
       return {
         statusCode: 200,
         data: {
-          model: provider.model || 'imagen-3.0-generate-002',
-          data: b64 ? [{ b64_json: b64, url: `data:image/png;base64,${b64}` }] : [],
+          model: imageModel,
+          data: outImages,
         },
       };
     }
@@ -413,6 +468,58 @@ async function invokeSingleProvider(
       } finally {
         clearTimeout(timer);
       }
+    }
+
+    if (provider.adapter === 'gemini') {
+      const apiKey = resolveProviderApiKey(provider);
+      if (!apiKey) {
+        throw Object.assign(new Error('Gemini upstream key is missing.'), { statusCode: 401 });
+      }
+      const ai = createGeminiClient(apiKey);
+      const videoModel = provider.model || 'gemini-omni-1.2-flash';
+
+      if (payload.__probeOnly === true) {
+        const meta = await ai.models.get({ model: videoModel });
+        return {
+          statusCode: 200,
+          data: {
+            model: meta.name || videoModel,
+            status: 'verified',
+          },
+        };
+      }
+
+      const interaction = await ai.interactions.create(
+        {
+          model: videoModel,
+          input: cleanPrompt,
+          background: false,
+          store: false,
+          stream: false,
+          response_format: {
+            type: 'video',
+            aspect_ratio: '16:9',
+            duration: '5s',
+            resolution: '720p',
+          },
+        },
+        { timeout: 300000 }
+      );
+      const videoPart = interaction.output_video;
+      if (!videoPart?.data) {
+        throw Object.assign(
+          new Error('Gemini Omni did not return video output for this prompt/key.'),
+          { statusCode: 502 }
+        );
+      }
+      const mime = videoPart.mime_type || 'video/mp4';
+      return {
+        statusCode: 200,
+        data: {
+          model: videoModel,
+          data: [{ b64_json: videoPart.data, url: `data:${mime};base64,${videoPart.data}` }],
+        },
+      };
     }
   }
 
@@ -558,7 +665,8 @@ async function invokeSingleProvider(
         { statusCode: 401 }
       );
     }
-    const ai = new GoogleGenAI({ apiKey });
+    const ai = createGeminiClient(apiKey);
+    const chatModel = provider.model || 'gemini-4-hydrogen';
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(
         () =>
@@ -573,7 +681,7 @@ async function invokeSingleProvider(
 
     const response = await Promise.race([
       ai.models.generateContent({
-        model: provider.model || 'gemini-2.5-flash',
+        model: chatModel,
         contents: promptText,
       }),
       timeoutPromise,
@@ -582,7 +690,7 @@ async function invokeSingleProvider(
     return {
       statusCode: 200,
       data: {
-        model: provider.model || 'gemini-2.5-flash',
+        model: chatModel,
         output: response.text ?? '',
       },
     };
@@ -812,6 +920,7 @@ export async function probeUpstreamProvider(
     await invokeSingleProvider(provider, {
       prompt: 'Reply with OK.',
       messages: [{ role: 'user', content: 'Reply with OK.' }],
+      __probeOnly: true,
     });
     const latencyMs = Math.max(1, Date.now() - start);
     provider.health = 'healthy';

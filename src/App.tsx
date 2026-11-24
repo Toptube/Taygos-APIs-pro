@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { onAuthStateChanged, type User } from 'firebase/auth';
 import { Globe, LogOut } from 'lucide-react';
 import { AuthGate } from './components/AuthGate';
 import { CopyButton } from './components/CopyButton';
@@ -10,6 +11,17 @@ import { ProvidersManager } from './components/ProvidersManager';
 import { TopBar, type WorkspaceTab } from './components/TopBar';
 import { UserGuide } from './components/UserGuide';
 import { useT } from './i18n/translations';
+import {
+  deleteCloudAccessKey,
+  deleteCloudProvider,
+  loadCloudVaultSnapshot,
+  saveCloudProvider,
+  saveCloudRouting,
+  saveNewCloudAccessKey,
+  updateCloudAccessKeyMeta,
+  updateCloudAccessKeySecret,
+} from './lib/cloudVault';
+import { auth, signOutFirebase } from './lib/firebase';
 import type {
   AccessKeyPublicView,
   AuthStatusResponse,
@@ -22,17 +34,21 @@ import type {
   RevealKeyResponse,
   RoutingConfig,
   SimulatorBehavior,
+  UpstreamProviderPublicView,
 } from './types/taygos';
 
 export default function App() {
   const [lang, setLang] = useState<Language>('ar');
   const [adminToken, setAdminToken] = useState<string | null>(null);
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [authResolved, setAuthResolved] = useState(false);
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
   const [overview, setOverview] = useState<GatewayOverviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('home');
   const [imageSpecialty, setImageSpecialty] = useState<ImageSpecialty>('all');
   const [isCreateKeyOpen, setIsCreateKeyOpen] = useState(false);
+  const syncedUidRef = useRef<string | null>(null);
 
   // Ephemeral playground credentials in memory only
   const [playgroundPk, setPlaygroundPk] = useState('');
@@ -59,6 +75,17 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'auto' });
   };
 
+  const getBearerToken = useCallback(async (): Promise<string | null> => {
+    if (auth.currentUser) {
+      try {
+        return await auth.currentUser.getIdToken();
+      } catch {
+        return adminToken;
+      }
+    }
+    return adminToken;
+  }, [adminToken]);
+
   const fetchAuthStatus = useCallback(async (token?: string | null) => {
     try {
       const headers: Record<string, string> = {};
@@ -66,7 +93,7 @@ export default function App() {
       const res = await fetch('/api/admin/auth/status', { headers });
       const data = (await res.json()) as AuthStatusResponse;
       setAuthStatus(data);
-      if (!data.authenticated && token) {
+      if (!data.authenticated && token && !auth.currentUser) {
         setAdminToken(null);
       }
     } catch {
@@ -74,6 +101,7 @@ export default function App() {
         requiresSetup: false,
         envPasscodeActive: false,
         authenticated: false,
+        firebaseEnabled: true,
       });
     } finally {
       setLoading(false);
@@ -81,14 +109,18 @@ export default function App() {
   }, []);
 
   const fetchOverview = useCallback(
-    async (token: string) => {
+    async (tokenOverride?: string | null) => {
+      const token = tokenOverride ?? (await getBearerToken());
+      if (!token) return;
       try {
         const res = await fetch('/api/admin/overview', {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (res.status === 401) {
-          setAdminToken(null);
-          await fetchAuthStatus(null);
+          if (!auth.currentUser) {
+            setAdminToken(null);
+            await fetchAuthStatus(null);
+          }
           return;
         }
         if (res.ok) {
@@ -99,18 +131,61 @@ export default function App() {
         // Ignore transient network errors
       }
     },
-    [fetchAuthStatus]
+    [fetchAuthStatus, getBearerToken]
   );
 
+  // Listen for Firebase Auth state (persists automatically across page refresh)
   useEffect(() => {
-    void fetchAuthStatus(adminToken);
-  }, [fetchAuthStatus, adminToken]);
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setFirebaseUser(user);
+      if (user) {
+        try {
+          const idToken = await user.getIdToken();
+          setAdminToken(idToken);
+          await fetchAuthStatus(idToken);
+
+          if (syncedUidRef.current !== user.uid) {
+            syncedUidRef.current = user.uid;
+            const snapshot = await loadCloudVaultSnapshot(user.uid);
+            if (
+              snapshot.accessKeys.length > 0 ||
+              snapshot.providers.length > 0 ||
+              snapshot.routing
+            ) {
+              await fetch('/api/admin/cloud/sync', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${idToken}`,
+                },
+                body: JSON.stringify(snapshot),
+              });
+            }
+          }
+          await fetchOverview(idToken);
+        } catch (err) {
+          console.error('Cloud vault sync error:', err);
+        }
+      } else {
+        syncedUidRef.current = null;
+      }
+      setAuthResolved(true);
+    });
+    return () => unsubscribe();
+  }, [fetchAuthStatus, fetchOverview]);
 
   useEffect(() => {
-    if (adminToken) {
+    if (!authResolved) return;
+    if (!firebaseUser) {
+      void fetchAuthStatus(adminToken);
+    }
+  }, [authResolved, firebaseUser, fetchAuthStatus, adminToken]);
+
+  useEffect(() => {
+    if (adminToken && !firebaseUser) {
       void fetchOverview(adminToken);
     }
-  }, [adminToken, fetchOverview]);
+  }, [adminToken, firebaseUser, fetchOverview]);
 
   const handleAuthenticated = (token: string) => {
     setAdminToken(token);
@@ -118,6 +193,11 @@ export default function App() {
 
   const handleSignOut = async () => {
     await fetch('/api/admin/auth/logout', { method: 'POST' }).catch(() => {});
+    if (auth.currentUser) {
+      await signOutFirebase().catch(() => {});
+    }
+    syncedUidRef.current = null;
+    setFirebaseUser(null);
     setAdminToken(null);
     setOverview(null);
     setPlaygroundSk('');
@@ -129,85 +209,107 @@ export default function App() {
     description: string;
     requireHmac: boolean;
   }): Promise<CreatedKeySecretResponse | null> => {
-    if (!adminToken) return null;
+    const token = await getBearerToken();
+    if (!token) return null;
     const res = await fetch('/api/admin/keys', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(input),
     });
     if (!res.ok) return null;
     const created = (await res.json()) as CreatedKeySecretResponse;
-    await fetchOverview(adminToken);
+    if (auth.currentUser) {
+      await saveNewCloudAccessKey(auth.currentUser.uid, created.key, created.secretKey);
+    }
+    await fetchOverview(token);
     return created;
   };
 
   const handleRevealKey = async (
     keyId: string
   ): Promise<RevealKeyResponse | null> => {
-    if (!adminToken) return null;
+    const token = await getBearerToken();
+    if (!token) return null;
     const res = await fetch(`/api/admin/keys/${keyId}/reveal`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${adminToken}` },
+      headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
     return (await res.json()) as RevealKeyResponse;
   };
 
   const handleToggleKeyStatus = async (key: AccessKeyPublicView) => {
-    if (!adminToken) return;
+    const token = await getBearerToken();
+    if (!token) return;
+    const nextStatus = key.status === 'active' ? 'revoked' : 'active';
     await fetch(`/api/admin/keys/${key.id}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({
-        status: key.status === 'active' ? 'revoked' : 'active',
+        status: nextStatus,
       }),
     });
-    await fetchOverview(adminToken);
+    if (auth.currentUser) {
+      await updateCloudAccessKeyMeta(auth.currentUser.uid, key.id, { status: nextStatus });
+    }
+    await fetchOverview(token);
   };
 
   const handleUpdateKeyMeta = async (
     keyId: string,
     patch: { name?: string; description?: string }
   ) => {
-    if (!adminToken) return;
+    const token = await getBearerToken();
+    if (!token) return;
     await fetch(`/api/admin/keys/${keyId}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(patch),
     });
-    await fetchOverview(adminToken);
+    if (auth.currentUser) {
+      await updateCloudAccessKeyMeta(auth.currentUser.uid, keyId, patch);
+    }
+    await fetchOverview(token);
   };
 
   const handleRotateKey = async (
     keyId: string
   ): Promise<CreatedKeySecretResponse | null> => {
-    if (!adminToken) return null;
+    const token = await getBearerToken();
+    if (!token) return null;
     const res = await fetch(`/api/admin/keys/${keyId}/rotate`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${adminToken}` },
+      headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
     const rotated = (await res.json()) as CreatedKeySecretResponse;
-    await fetchOverview(adminToken);
+    if (auth.currentUser) {
+      await updateCloudAccessKeySecret(auth.currentUser.uid, rotated.key, rotated.secretKey);
+    }
+    await fetchOverview(token);
     return rotated;
   };
 
   const handleDeleteKey = async (keyId: string) => {
-    if (!adminToken) return;
+    const token = await getBearerToken();
+    if (!token) return;
     await fetch(`/api/admin/keys/${keyId}`, {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${adminToken}` },
+      headers: { Authorization: `Bearer ${token}` },
     });
-    await fetchOverview(adminToken);
+    if (auth.currentUser) {
+      await deleteCloudAccessKey(auth.currentUser.uid, keyId);
+    }
+    await fetchOverview(token);
   };
 
   const handleAddProvider = async (input: {
@@ -222,12 +324,13 @@ export default function App() {
     priority: number;
     timeoutMs: number;
   }): Promise<boolean> => {
-    if (!adminToken) return false;
+    const token = await getBearerToken();
+    if (!token) return false;
     const res = await fetch('/api/admin/providers', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(input),
     });
@@ -235,19 +338,24 @@ export default function App() {
       const err = (await res.json()) as { error?: string };
       throw new Error(err.error || 'Failed to add provider.');
     }
-    await fetchOverview(adminToken);
+    const created = (await res.json()) as { provider?: UpstreamProviderPublicView };
+    if (auth.currentUser && created.provider) {
+      await saveCloudProvider(auth.currentUser.uid, created.provider, input.apiKey);
+    }
+    await fetchOverview(token);
     return true;
   };
 
   const handleBulkImportProviders = async (
     items: Array<Record<string, unknown>>
   ): Promise<{ createdCount: number; errorCount: number }> => {
-    if (!adminToken) return { createdCount: 0, errorCount: items.length };
+    const token = await getBearerToken();
+    if (!token) return { createdCount: 0, errorCount: items.length };
     const res = await fetch('/api/admin/providers/bulk', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({ providers: items }),
     });
@@ -258,13 +366,25 @@ export default function App() {
     const result = (await res.json()) as {
       createdCount: number;
       errorCount: number;
+      providers?: UpstreamProviderPublicView[];
     };
-    await fetchOverview(adminToken);
-    return result;
+    if (auth.currentUser && Array.isArray(result.providers)) {
+      for (const prov of result.providers) {
+        const matchedInput = items.find(
+          (item) => typeof item?.name === 'string' && item.name.trim() === prov.name
+        );
+        const plainKey =
+          typeof matchedInput?.apiKey === 'string' ? matchedInput.apiKey : '';
+        await saveCloudProvider(auth.currentUser.uid, prov, plainKey);
+      }
+    }
+    await fetchOverview(token);
+    return { createdCount: result.createdCount, errorCount: result.errorCount };
   };
 
   const handleImportFromUrl = async (url: string) => {
-    if (!adminToken) {
+    const token = await getBearerToken();
+    if (!token) {
       return {
         sourceUrl: url,
         discoveredCount: 0,
@@ -276,7 +396,7 @@ export default function App() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({ url }),
     });
@@ -286,11 +406,17 @@ export default function App() {
       discoveredCount?: number;
       createdCount?: number;
       skippedCount?: number;
+      providers?: UpstreamProviderPublicView[];
     };
     if (!res.ok) {
       throw new Error(data.error || 'Failed to import from URL.');
     }
-    await fetchOverview(adminToken);
+    if (auth.currentUser && Array.isArray(data.providers)) {
+      for (const prov of data.providers) {
+        await saveCloudProvider(auth.currentUser.uid, prov, '');
+      }
+    }
+    await fetchOverview(token);
     return {
       sourceUrl: data.sourceUrl || url,
       discoveredCount: data.discoveredCount ?? 0,
@@ -312,80 +438,103 @@ export default function App() {
       resetCircuit?: boolean;
     }
   ) => {
-    if (!adminToken) return;
-    await fetch(`/api/admin/providers/${id}`, {
+    const token = await getBearerToken();
+    if (!token) return;
+    const res = await fetch(`/api/admin/providers/${id}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(patch),
     });
-    await fetchOverview(adminToken);
+    if (res.ok && auth.currentUser) {
+      const updated = (await res.json()) as { provider?: UpstreamProviderPublicView };
+      if (updated.provider) {
+        await saveCloudProvider(
+          auth.currentUser.uid,
+          updated.provider,
+          typeof patch.apiKey === 'string' ? patch.apiKey : undefined
+        );
+      }
+    }
+    await fetchOverview(token);
   };
 
   const handleProbeProvider = async (id: string) => {
-    if (!adminToken) return null;
+    const token = await getBearerToken();
+    if (!token) return null;
     const res = await fetch(`/api/admin/providers/${id}/probe`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${adminToken}` },
+      headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
     const json = (await res.json()) as {
       probe: { ok: boolean; statusCode: number; latencyMs: number; message: string };
     };
-    await fetchOverview(adminToken);
+    await fetchOverview(token);
     return json.probe;
   };
 
   const handleProbeAllProviders = async () => {
-    if (!adminToken) return null;
+    const token = await getBearerToken();
+    if (!token) return null;
     const res = await fetch('/api/admin/providers/probe-all', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${adminToken}` },
+      headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
     const json = (await res.json()) as {
       checkedCount: number;
       operationalCount: number;
     };
-    await fetchOverview(adminToken);
+    await fetchOverview(token);
     return json;
   };
 
   const handleDeleteProvider = async (id: string) => {
-    if (!adminToken) return;
+    const token = await getBearerToken();
+    if (!token) return;
     await fetch(`/api/admin/providers/${id}`, {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${adminToken}` },
+      headers: { Authorization: `Bearer ${token}` },
     });
-    await fetchOverview(adminToken);
+    if (auth.currentUser) {
+      await deleteCloudProvider(auth.currentUser.uid, id);
+    }
+    await fetchOverview(token);
   };
 
   const handleSaveRouting = async (
     next: Partial<RoutingConfig>
   ): Promise<boolean> => {
-    if (!adminToken) return false;
+    const token = await getBearerToken();
+    if (!token) return false;
     const res = await fetch('/api/admin/routing', {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(next),
     });
     if (!res.ok) return false;
-    await fetchOverview(adminToken);
+    const data = (await res.json()) as { routing?: RoutingConfig };
+    if (auth.currentUser && data.routing) {
+      await saveCloudRouting(auth.currentUser.uid, data.routing);
+    }
+    await fetchOverview(token);
     return true;
   };
 
   const handleClearLogs = async () => {
-    if (!adminToken) return;
+    const token = await getBearerToken();
+    if (!token) return;
     await fetch('/api/admin/logs', {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${adminToken}` },
+      headers: { Authorization: `Bearer ${token}` },
     });
-    await fetchOverview(adminToken);
+    await fetchOverview(token);
   };
 
   if (loading || !authStatus) {
@@ -540,7 +689,11 @@ export default function App() {
                 <span>
                   Vault:{' '}
                   <strong className="text-slate-800">
-                    {overview.hasMasterEncryptionKey ? 'Active' : 'Session'}
+                    {firebaseUser
+                      ? 'Firebase Cloud'
+                      : overview.hasMasterEncryptionKey
+                        ? 'Active'
+                        : 'Session'}
                   </strong>
                 </span>
                 <span aria-hidden="true">·</span>

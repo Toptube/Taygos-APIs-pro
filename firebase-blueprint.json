@@ -1,0 +1,302 @@
+{
+  "entities": {
+    "UserVaultProfile": {
+      "title": "UserVaultProfile",
+      "description": "Owner root document gating private API key and provider subcollections.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the vault owner."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Non-PII display label for the workspace."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": ["ownerId", "displayName", "createdAt", "updatedAt"]
+    },
+    "CloudAccessKey": {
+      "title": "CloudAccessKey",
+      "description": "Perpetual Taygos unified gateway public and secret key pair.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "description": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 200
+        },
+        "publicKey": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 120
+        },
+        "secretKey": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 160
+        },
+        "secretMasked": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 64
+        },
+        "perpetual": {
+          "type": "boolean"
+        },
+        "requireHmac": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "revoked"],
+          "maxLength": 16
+        },
+        "scopes": {
+          "type": "array",
+          "description": "Up to 8 scope identifiers."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "id",
+        "name",
+        "description",
+        "publicKey",
+        "secretKey",
+        "secretMasked",
+        "perpetual",
+        "requireHmac",
+        "status",
+        "scopes",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CloudProviderConfig": {
+      "title": "CloudProviderConfig",
+      "description": "Persisted upstream AI provider settings and API credential.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "slug": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 80
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "category": {
+          "type": "string",
+          "enum": ["llm", "image", "video", "audio", "documents"],
+          "maxLength": 16
+        },
+        "specialty": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 80
+        },
+        "adapter": {
+          "type": "string",
+          "enum": [
+            "gemini",
+            "openai-compatible",
+            "anthropic",
+            "custom-rest",
+            "sandbox-simulator"
+          ],
+          "maxLength": 32
+        },
+        "baseUrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "authHeader": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "apiKey": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 512
+        },
+        "apiKeyMasked": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "usesServerEnv": {
+          "type": "boolean"
+        },
+        "requiresApiKey": {
+          "type": "boolean"
+        },
+        "priority": {
+          "type": "number"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "timeoutMs": {
+          "type": "number"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "id",
+        "slug",
+        "name",
+        "category",
+        "specialty",
+        "adapter",
+        "baseUrl",
+        "model",
+        "authHeader",
+        "apiKey",
+        "apiKeyMasked",
+        "usesServerEnv",
+        "requiresApiKey",
+        "priority",
+        "weight",
+        "timeoutMs",
+        "enabled",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CloudRoutingConfig": {
+      "title": "CloudRoutingConfig",
+      "description": "Persisted gateway failover and circuit breaker settings.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "strategy": {
+          "type": "string",
+          "enum": ["priority_failover", "round_robin", "lowest_latency"],
+          "maxLength": 32
+        },
+        "maxRetries": {
+          "type": "number"
+        },
+        "circuitBreakerThreshold": {
+          "type": "number"
+        },
+        "cooldownSeconds": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "strategy",
+        "maxRetries",
+        "circuitBreakerThreshold",
+        "cooldownSeconds",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserVaultProfile" },
+      "description": "Private user vault profile document."
+    },
+    "/users/{userId}/accessKeys/{keyId}": {
+      "schema": { "$ref": "#/entities/CloudAccessKey" },
+      "description": "User's perpetual Taygos public and secret access keys."
+    },
+    "/users/{userId}/providers/{providerId}": {
+      "schema": { "$ref": "#/entities/CloudProviderConfig" },
+      "description": "User's upstream provider configs and saved API keys."
+    },
+    "/users/{userId}/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/CloudRoutingConfig" },
+      "description": "User's routing and failover settings (document id: routing)."
+    }
+  }
+}

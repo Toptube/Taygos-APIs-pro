@@ -14,6 +14,7 @@ import type {
 } from '../src/types/taygos.ts';
 import { TAYGOS_GITHUB_CATALOG } from './catalog.ts';
 import {
+  assertSafeUpstreamUrl,
   generateTaygosKeyPair,
   hashSecret,
   maskCredential,
@@ -78,6 +79,7 @@ export interface StoredUpstreamProvider {
 
 export interface StoreSchema {
   adminPasswordHash: string | null;
+  adminOwnerUid?: string | null;
   keys: StoredAccessKey[];
   providers: StoredUpstreamProvider[];
   routing: RoutingConfig;
@@ -226,6 +228,7 @@ function createDefaultProviders(): StoredUpstreamProvider[] {
 function createInitialStore(): StoreSchema {
   return {
     adminPasswordHash: null,
+    adminOwnerUid: null,
     keys: [],
     providers: createDefaultProviders(),
     routing: {
@@ -279,6 +282,9 @@ function mergeMissingCatalogProviders(store: StoreSchema): boolean {
         changed = true;
       }
       const syncSlugEndpoints = new Set([
+        'google-gemini',
+        'google-gemini-imagen',
+        'google-gemini-veo',
         'pollinations-text',
         'pollinations-audio',
         'pollinations-mai-voice',
@@ -295,6 +301,10 @@ function mergeMissingCatalogProviders(store: StoreSchema): boolean {
         }
         if (existing.model !== spec.model) {
           existing.model = spec.model;
+          existing.lastError = null;
+          existing.consecutiveFailures = 0;
+          existing.cooldownUntil = null;
+          existing.health = isProviderConfigured(existing) ? 'healthy' : 'needs_key';
           changed = true;
         }
         if (existing.adapter !== spec.adapter) {
@@ -358,6 +368,7 @@ function ensureStoreLoaded(): StoreSchema {
       const parsed = JSON.parse(raw) as StoreSchema;
       memoryStore = {
         adminPasswordHash: parsed.adminPasswordHash ?? null,
+        adminOwnerUid: parsed.adminOwnerUid ?? null,
         keys: Array.isArray(parsed.keys) ? parsed.keys : [],
         providers: Array.isArray(parsed.providers)
           ? parsed.providers
@@ -633,3 +644,223 @@ export function appendGatewayLog(entry: GatewayLogEntry): void {
   }
   persistStore();
 }
+
+export interface CloudSyncKeyInput {
+  id: string;
+  name: string;
+  description: string;
+  publicKey: string;
+  secretKey: string;
+  perpetual: boolean;
+  requireHmac: boolean;
+  status: KeyStatus;
+  scopes: string[];
+}
+
+export interface CloudSyncProviderInput {
+  id: string;
+  slug?: string;
+  name: string;
+  category: ProviderCategory;
+  specialty?: string;
+  adapter: ProviderAdapter;
+  baseUrl: string;
+  model: string;
+  authHeader: string;
+  apiKey: string;
+  usesServerEnv: boolean;
+  requiresApiKey: boolean;
+  priority: number;
+  weight: number;
+  timeoutMs: number;
+  enabled: boolean;
+}
+
+export async function syncCloudVaultToStore(input: {
+  accessKeys?: CloudSyncKeyInput[];
+  providers?: CloudSyncProviderInput[];
+  routing?: Partial<RoutingConfig> | null;
+}): Promise<{ syncedKeys: number; syncedProviders: number }> {
+  const store = ensureStoreLoaded();
+  let syncedKeys = 0;
+  let syncedProviders = 0;
+
+  if (Array.isArray(input.accessKeys)) {
+    for (const k of input.accessKeys) {
+      if (!k?.id || !k?.publicKey || !k?.secretKey) continue;
+      const existingIdx = store.keys.findIndex(
+        (item) => item.id === k.id || item.publicKey === k.publicKey
+      );
+      const nextSealed = sealSecret(k.secretKey);
+      const nextHash = hashSecret(k.secretKey);
+      const nextMasked = maskCredential(k.secretKey);
+      if (existingIdx >= 0) {
+        const cur = store.keys[existingIdx];
+        cur.name = k.name.slice(0, 80);
+        cur.description = (k.description || '').slice(0, 200);
+        cur.publicKey = k.publicKey;
+        cur.secretMasked = nextMasked;
+        cur.secretHash = nextHash;
+        cur.hmacSealedSecret = nextSealed;
+        cur.requireHmac = Boolean(k.requireHmac);
+        cur.status = k.status === 'revoked' ? 'revoked' : 'active';
+        cur.scopes = Array.isArray(k.scopes) && k.scopes.length ? k.scopes.slice(0, 8) : cur.scopes;
+      } else {
+        store.keys.unshift({
+          id: k.id,
+          name: k.name.slice(0, 80),
+          description: (k.description || '').slice(0, 200),
+          publicKey: k.publicKey,
+          secretMasked: nextMasked,
+          secretHash: nextHash,
+          hmacSealedSecret: nextSealed,
+          perpetual: k.perpetual !== false,
+          expiresAt: null,
+          scopes: Array.isArray(k.scopes) && k.scopes.length ? k.scopes.slice(0, 8) : ['gateway:execute'],
+          requireHmac: Boolean(k.requireHmac),
+          status: k.status === 'revoked' ? 'revoked' : 'active',
+          createdAt: new Date().toISOString(),
+          lastUsedAt: null,
+          requestCount: 0,
+          failoverCount: 0,
+        });
+      }
+      syncedKeys += 1;
+    }
+  }
+
+  if (Array.isArray(input.providers)) {
+    for (const p of input.providers) {
+      if (!p?.id || !p?.name || !p?.baseUrl) continue;
+
+      let safeBaseUrl = p.baseUrl.trim();
+      if (
+        p.adapter !== 'sandbox-simulator' &&
+        p.adapter !== 'gemini' &&
+        !safeBaseUrl.startsWith('internal://') &&
+        !safeBaseUrl.startsWith('sandbox://')
+      ) {
+        try {
+          const validated = await assertSafeUpstreamUrl(safeBaseUrl);
+          safeBaseUrl = validated.toString();
+        } catch {
+          continue;
+        }
+      }
+
+      const existing = store.providers.find(
+        (item) => item.id === p.id || (p.slug && item.slug === p.slug)
+      );
+      const apiKeyPlain = typeof p.apiKey === 'string' ? p.apiKey.trim() : '';
+
+      if (existing) {
+        existing.name = p.name.slice(0, 100);
+        existing.category = p.category || existing.category || 'llm';
+        if (p.specialty) existing.specialty = p.specialty;
+        existing.adapter = p.adapter;
+        existing.baseUrl = safeBaseUrl;
+        // Avoid downgrading synced catalog Gemini models back to deprecated names
+        const isDeprecatedModel =
+          p.model === 'gemini-2.5-flash' ||
+          p.model === 'imagen-3.0-generate-002' ||
+          p.model === 'veo-2.0-generate-001';
+        if (!isDeprecatedModel && p.model) {
+          existing.model = p.model.slice(0, 120);
+        }
+        existing.authHeader = p.authHeader || existing.authHeader || 'Authorization';
+        existing.priority = Math.max(1, Math.min(999, Math.round(p.priority || existing.priority)));
+        existing.weight = Math.max(1, Math.min(100, Math.round(p.weight || existing.weight)));
+        existing.timeoutMs = Math.max(1000, Math.min(60000, Math.round(p.timeoutMs || existing.timeoutMs)));
+        existing.enabled = Boolean(p.enabled);
+
+        if (p.usesServerEnv && existing.adapter === 'gemini') {
+          existing.usesServerEnv = true;
+          existing.apiKeyMasked = 'env:GEMINI_API_KEY';
+          existing.apiKeySealed = '';
+          existing.health = process.env.GEMINI_API_KEY?.trim() ? 'healthy' : 'needs_key';
+        } else if (apiKeyPlain) {
+          existing.usesServerEnv = false;
+          existing.apiKeyMasked = maskCredential(apiKeyPlain);
+          existing.apiKeySealed = sealSecret(apiKeyPlain);
+          existing.health = 'healthy';
+          existing.consecutiveFailures = 0;
+          existing.cooldownUntil = null;
+          existing.lastError = null;
+        }
+      } else {
+        const requiresKey =
+          typeof p.requiresApiKey === 'boolean'
+            ? p.requiresApiKey
+            : p.adapter !== 'sandbox-simulator';
+        const configured =
+          p.usesServerEnv || Boolean(apiKeyPlain) || !requiresKey || p.adapter === 'sandbox-simulator';
+        store.providers.push({
+          id: p.id,
+          slug: p.slug || undefined,
+          name: p.name.slice(0, 100),
+          category: p.category || 'llm',
+          specialty: p.specialty || undefined,
+          adapter: p.adapter,
+          baseUrl: safeBaseUrl,
+          model: (p.model || 'default').slice(0, 120),
+          authHeader: p.authHeader || 'Authorization',
+          apiKeyMasked: p.usesServerEnv
+            ? 'env:GEMINI_API_KEY'
+            : apiKeyPlain
+              ? maskCredential(apiKeyPlain)
+              : !requiresKey
+                ? 'anonymous-free-tier'
+                : 'not-set',
+          apiKeySealed: p.usesServerEnv || !apiKeyPlain ? '' : sealSecret(apiKeyPlain),
+          usesServerEnv: Boolean(p.usesServerEnv && p.adapter === 'gemini'),
+          requiresApiKey: requiresKey,
+          priority: Math.max(1, Math.min(999, Math.round(p.priority || 50))),
+          weight: Math.max(1, Math.min(100, Math.round(p.weight || 50))),
+          timeoutMs: Math.max(1000, Math.min(60000, Math.round(p.timeoutMs || 12000))),
+          enabled: Boolean(p.enabled),
+          health: configured ? 'healthy' : 'needs_key',
+          consecutiveFailures: 0,
+          cooldownUntil: null,
+          simulatorBehavior: 'healthy',
+          totalRequests: 0,
+          successfulRequests: 0,
+          failedRequests: 0,
+          avgLatencyMs: 0,
+          lastError: null,
+          lastCheckedAt: null,
+        });
+      }
+      syncedProviders += 1;
+    }
+    store.providers.sort((a, b) => a.priority - b.priority);
+  }
+
+  if (input.routing) {
+    if (
+      input.routing.strategy &&
+      ['priority_failover', 'round_robin', 'lowest_latency'].includes(input.routing.strategy)
+    ) {
+      store.routing.strategy = input.routing.strategy;
+    }
+    if (typeof input.routing.maxRetries === 'number') {
+      store.routing.maxRetries = Math.max(0, Math.min(10, Math.round(input.routing.maxRetries)));
+    }
+    if (typeof input.routing.circuitBreakerThreshold === 'number') {
+      store.routing.circuitBreakerThreshold = Math.max(
+        1,
+        Math.min(10, Math.round(input.routing.circuitBreakerThreshold))
+      );
+    }
+    if (typeof input.routing.cooldownSeconds === 'number') {
+      store.routing.cooldownSeconds = Math.max(
+        5,
+        Math.min(600, Math.round(input.routing.cooldownSeconds))
+      );
+    }
+  }
+
+  mergeMissingCatalogProviders(store);
+  persistStore();
+  return { syncedKeys, syncedProviders };
+}
+

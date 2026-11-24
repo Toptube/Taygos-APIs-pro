@@ -1,0 +1,382 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core security primitives
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function hasValidUserVaultParent(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId)) &&
+        get(/databases/$(database)/documents/users/$(userId)).data.ownerId == request.auth.uid;
+    }
+
+    function isValidUserVault(data) {
+      return data.keys().hasAll(['ownerId', 'displayName', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'displayName', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.displayName is string &&
+        data.displayName.size() >= 1 &&
+        data.displayName.size() <= 120 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidScopesList(scopes) {
+      return scopes is list &&
+        scopes.size() <= 8 &&
+        (scopes.size() == 0 || (scopes[0] is string && scopes[0].size() <= 64));
+    }
+
+    function isValidAccessKey(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'id',
+          'name',
+          'description',
+          'publicKey',
+          'secretKey',
+          'secretMasked',
+          'perpetual',
+          'requireHmac',
+          'status',
+          'scopes',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId',
+          'id',
+          'name',
+          'description',
+          'publicKey',
+          'secretKey',
+          'secretMasked',
+          'perpetual',
+          'requireHmac',
+          'status',
+          'scopes',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.ownerId is string &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.id is string &&
+        isValidId(data.id) &&
+        data.name is string &&
+        data.name.size() >= 1 &&
+        data.name.size() <= 80 &&
+        data.description is string &&
+        data.description.size() <= 200 &&
+        data.publicKey is string &&
+        data.publicKey.size() >= 10 &&
+        data.publicKey.size() <= 120 &&
+        data.secretKey is string &&
+        data.secretKey.size() >= 10 &&
+        data.secretKey.size() <= 160 &&
+        data.secretMasked is string &&
+        data.secretMasked.size() >= 4 &&
+        data.secretMasked.size() <= 64 &&
+        data.perpetual is bool &&
+        data.requireHmac is bool &&
+        data.status is string &&
+        data.status.size() <= 16 &&
+        data.status in ['active', 'revoked'] &&
+        isValidScopesList(data.scopes) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidProviderConfig(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'id',
+          'slug',
+          'name',
+          'category',
+          'specialty',
+          'adapter',
+          'baseUrl',
+          'model',
+          'authHeader',
+          'apiKey',
+          'apiKeyMasked',
+          'usesServerEnv',
+          'requiresApiKey',
+          'priority',
+          'weight',
+          'timeoutMs',
+          'enabled',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId',
+          'id',
+          'slug',
+          'name',
+          'category',
+          'specialty',
+          'adapter',
+          'baseUrl',
+          'model',
+          'authHeader',
+          'apiKey',
+          'apiKeyMasked',
+          'usesServerEnv',
+          'requiresApiKey',
+          'priority',
+          'weight',
+          'timeoutMs',
+          'enabled',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.ownerId is string &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.id is string &&
+        isValidId(data.id) &&
+        data.slug is string &&
+        data.slug.size() <= 80 &&
+        data.name is string &&
+        data.name.size() >= 1 &&
+        data.name.size() <= 100 &&
+        data.category is string &&
+        data.category.size() <= 16 &&
+        data.category in ['llm', 'image', 'video', 'audio', 'documents'] &&
+        data.specialty is string &&
+        data.specialty.size() <= 80 &&
+        data.adapter is string &&
+        data.adapter.size() <= 32 &&
+        data.adapter in ['gemini', 'openai-compatible', 'anthropic', 'custom-rest', 'sandbox-simulator'] &&
+        data.baseUrl is string &&
+        data.baseUrl.size() >= 1 &&
+        data.baseUrl.size() <= 500 &&
+        data.model is string &&
+        data.model.size() >= 1 &&
+        data.model.size() <= 120 &&
+        data.authHeader is string &&
+        data.authHeader.size() >= 1 &&
+        data.authHeader.size() <= 60 &&
+        data.apiKey is string &&
+        data.apiKey.size() <= 512 &&
+        data.apiKeyMasked is string &&
+        data.apiKeyMasked.size() >= 1 &&
+        data.apiKeyMasked.size() <= 80 &&
+        data.usesServerEnv is bool &&
+        data.requiresApiKey is bool &&
+        data.priority is int &&
+        data.priority >= 1 &&
+        data.priority <= 999 &&
+        data.weight is int &&
+        data.weight >= 1 &&
+        data.weight <= 100 &&
+        data.timeoutMs is int &&
+        data.timeoutMs >= 1000 &&
+        data.timeoutMs <= 60000 &&
+        data.enabled is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidRoutingConfig(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'strategy',
+          'maxRetries',
+          'circuitBreakerThreshold',
+          'cooldownSeconds',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId',
+          'strategy',
+          'maxRetries',
+          'circuitBreakerThreshold',
+          'cooldownSeconds',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.ownerId is string &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.strategy is string &&
+        data.strategy.size() <= 32 &&
+        data.strategy in ['priority_failover', 'round_robin', 'lowest_latency'] &&
+        data.maxRetries is int &&
+        data.maxRetries >= 0 &&
+        data.maxRetries <= 10 &&
+        data.circuitBreakerThreshold is int &&
+        data.circuitBreakerThreshold >= 1 &&
+        data.circuitBreakerThreshold <= 10 &&
+        data.cooldownSeconds is int &&
+        data.cooldownSeconds >= 5 &&
+        data.cooldownSeconds <= 600 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId) && existing().ownerId == request.auth.uid;
+      allow list: if false;
+      allow create: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserVault(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserVault(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']);
+      allow delete: if isOwner(userId) && isValidId(userId);
+
+      match /accessKeys/{keyId} {
+        allow get: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(keyId) &&
+          existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(keyId) &&
+          isValidAccessKey(incoming()) &&
+          incoming().id == keyId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidUserVaultParent(userId);
+        allow update: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(keyId) &&
+          isValidAccessKey(incoming()) &&
+          hasValidUserVaultParent(userId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().id == existing().id &&
+          incoming().publicKey == existing().publicKey &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'status', 'requireHmac', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['secretKey', 'secretMasked', 'updatedAt'])
+          );
+        allow delete: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(keyId) &&
+          existing().ownerId == request.auth.uid;
+      }
+
+      match /providers/{providerId} {
+        allow get: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(providerId) &&
+          existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(providerId) &&
+          isValidProviderConfig(incoming()) &&
+          incoming().id == providerId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidUserVaultParent(userId);
+        allow update: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(providerId) &&
+          isValidProviderConfig(incoming()) &&
+          hasValidUserVaultParent(userId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().id == existing().id &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'category',
+            'specialty',
+            'adapter',
+            'baseUrl',
+            'model',
+            'authHeader',
+            'apiKey',
+            'apiKeyMasked',
+            'usesServerEnv',
+            'requiresApiKey',
+            'priority',
+            'weight',
+            'timeoutMs',
+            'enabled',
+            'updatedAt'
+          ]);
+        allow delete: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(providerId) &&
+          existing().ownerId == request.auth.uid;
+      }
+
+      match /settings/{settingId} {
+        allow get: if isOwner(userId) &&
+          isValidId(userId) &&
+          settingId == 'routing' &&
+          existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isOwner(userId) &&
+          isValidId(userId) &&
+          settingId == 'routing' &&
+          isValidRoutingConfig(incoming()) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidUserVaultParent(userId);
+        allow update: if isOwner(userId) &&
+          isValidId(userId) &&
+          settingId == 'routing' &&
+          isValidRoutingConfig(incoming()) &&
+          hasValidUserVaultParent(userId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'strategy',
+            'maxRetries',
+            'circuitBreakerThreshold',
+            'cooldownSeconds',
+            'updatedAt'
+          ]);
+        allow delete: if isOwner(userId) &&
+          isValidId(userId) &&
+          settingId == 'routing' &&
+          existing().ownerId == request.auth.uid;
+      }
+    }
+  }
+}
