@@ -298,7 +298,7 @@ service cloud.firestore {
         allow delete: if isOwner(userId) &&
           isValidId(userId) &&
           isValidId(keyId) &&
-          existing().ownerId == request.auth.uid;
+          (resource == null || existing().ownerId == request.auth.uid);
       }
 
       match /providers/{providerId} {
@@ -345,7 +345,7 @@ service cloud.firestore {
         allow delete: if isOwner(userId) &&
           isValidId(userId) &&
           isValidId(providerId) &&
-          existing().ownerId == request.auth.uid;
+          (resource == null || existing().ownerId == request.auth.uid);
       }
 
       match /settings/{settingId} {
@@ -379,7 +379,7 @@ service cloud.firestore {
         allow delete: if isOwner(userId) &&
           isValidId(userId) &&
           settingId == 'routing' &&
-          existing().ownerId == request.auth.uid;
+          (resource == null || existing().ownerId == request.auth.uid);
       }
     }
   }

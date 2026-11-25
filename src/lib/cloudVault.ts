@@ -330,8 +330,16 @@ export async function deleteCloudAccessKey(uid: string, keyId: string): Promise<
   const safeUid = sanitizeId(uid, 'user');
   const safeKeyId = sanitizeId(keyId, 'key');
   const path = `users/${safeUid}/accessKeys/${safeKeyId}`;
+  const ref = doc(db, 'users', safeUid, 'accessKeys', safeKeyId);
+  let snap;
   try {
-    await deleteDoc(doc(db, 'users', safeUid, 'accessKeys', safeKeyId));
+    snap = await getDoc(ref);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+  if (!snap.exists()) return;
+  try {
+    await deleteDoc(ref);
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -414,8 +422,16 @@ export async function deleteCloudProvider(uid: string, providerId: string): Prom
   const safeUid = sanitizeId(uid, 'user');
   const safeProvId = sanitizeId(providerId, 'prov');
   const path = `users/${safeUid}/providers/${safeProvId}`;
+  const ref = doc(db, 'users', safeUid, 'providers', safeProvId);
+  let snap;
   try {
-    await deleteDoc(doc(db, 'users', safeUid, 'providers', safeProvId));
+    snap = await getDoc(ref);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+  if (!snap.exists()) return;
+  try {
+    await deleteDoc(ref);
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
