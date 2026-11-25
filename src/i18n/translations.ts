@@ -3,7 +3,8 @@ import type { Language } from '../types/taygos';
 export const translations = {
   ar: {
     brand: 'Taygos APIs',
-    navHome: 'الرئيسية',
+    navStudio: 'استوديو الشمساوية',
+    navHome: 'لوحة تايجوس',
     navKeys: 'تطبيقاتي',
     navProviders: 'مزودو الشات',
     navImages: 'APIs للصور',
@@ -163,7 +164,8 @@ export const translations = {
   },
   en: {
     brand: 'Taygos APIs',
-    navHome: 'Home',
+    navStudio: 'Shamsawya Studio',
+    navHome: 'Taygos Home',
     navKeys: 'My Apps',
     navProviders: 'Chat APIs',
     navImages: 'Image APIs',

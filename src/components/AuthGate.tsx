@@ -118,8 +118,8 @@ export const AuthGate: React.FC<AuthGateProps> = ({
 
         <p className="text-sm text-slate-600 leading-relaxed">
           {lang === 'ar'
-            ? 'الدخول بحساب Google (السوبر أدمن) يفتح اللوحة مباشرة بدون الحاجة لرمز التحقق مرة أخرى، ويحفظ جميع مفاتيحك ومزوداتك بشكل دائم في Firebase Firestore.'
-            : 'Signing in with the Super Admin Google account unlocks the dashboard directly with permanent Firebase Firestore cloud persistence.'}
+            ? 'الدخول بحساب Google (أحد حسابات السوبر أدمن المعتمدة) يفتح لوحة Taygos APIs مباشرة مع حفظ دائم في Firebase Firestore.'
+            : 'Signing in with an authorized Super Admin Google account unlocks Taygos APIs directly with Firebase Firestore persistence.'}
         </p>
 
         {firebaseEnabled && (

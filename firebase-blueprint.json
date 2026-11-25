@@ -279,6 +279,71 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "StudioProjectMeta": {
+      "title": "StudioProjectMeta",
+      "description": "Saved Al-Shamsawya Studio project metadata and compact preview thumbnail.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "craftType": {
+          "type": "string",
+          "enum": ["macrame", "burlap", "bags", "decor", "custom"],
+          "maxLength": 24
+        },
+        "thumbnailDataUrl": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 350000
+        },
+        "activePrompt": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 1000
+        },
+        "assetCount": {
+          "type": "number"
+        },
+        "dimensionCount": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "id",
+        "title",
+        "craftType",
+        "thumbnailDataUrl",
+        "activePrompt",
+        "assetCount",
+        "dimensionCount",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -297,6 +362,10 @@
     "/users/{userId}/settings/{settingId}": {
       "schema": { "$ref": "#/entities/CloudRoutingConfig" },
       "description": "User's routing and failover settings (document id: routing)."
+    },
+    "/users/{userId}/studioProjects/{projectId}": {
+      "schema": { "$ref": "#/entities/StudioProjectMeta" },
+      "description": "Al-Shamsawya Studio saved project metadata and preview thumbnails."
     }
   }
 }

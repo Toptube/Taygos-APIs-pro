@@ -126,6 +126,51 @@ export function verifyAdminSessionToken(token: string): boolean {
   }
 }
 
+export function createStudioBridgeToken(ttlSeconds = 60 * 60 * 12): string {
+  const payload = {
+    sub: 'shamsawya-studio-bridge',
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + ttlSeconds,
+    jti: crypto.randomBytes(10).toString('hex'),
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(payloadB64)
+    .digest('base64url');
+  return `${payloadB64}.${sig}`;
+}
+
+export function verifyStudioBridgeToken(token: string): boolean {
+  if (!token) return false;
+  const dotIdx = token.indexOf('.');
+  if (dotIdx <= 0) return false;
+  const payloadB64 = token.slice(0, dotIdx);
+  const sigB64 = token.slice(dotIdx + 1);
+  if (!payloadB64 || !sigB64) return false;
+  try {
+    const expectedSig = crypto
+      .createHmac('sha256', getSessionSecret())
+      .update(payloadB64)
+      .digest('base64url');
+    const actualBuf = Buffer.from(sigB64, 'utf8');
+    const expectedBuf = Buffer.from(expectedSig, 'utf8');
+    if (actualBuf.length !== expectedBuf.length) return false;
+    if (!crypto.timingSafeEqual(actualBuf, expectedBuf)) return false;
+
+    const decoded = JSON.parse(
+      Buffer.from(payloadB64, 'base64url').toString('utf8')
+    ) as { exp?: number; sub?: string };
+    if (decoded.sub !== 'shamsawya-studio-bridge') return false;
+    if (!decoded.exp || decoded.exp < Math.floor(Date.now() / 1000)) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function generateTaygosKeyPair(): {
   publicKey: string;
   secretKey: string;

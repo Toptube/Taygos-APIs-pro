@@ -89,14 +89,49 @@ export interface StoreSchema {
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const STORE_PATH = path.join(DATA_DIR, 'taygos-store.json');
 
-function isProviderConfigured(p: StoredUpstreamProvider): boolean {
+function resolveProviderVendorGroup(p: {
+  slug?: string;
+  baseUrl: string;
+}): string {
+  const s = (p.slug || '').toLowerCase();
+  const u = (p.baseUrl || '').toLowerCase();
+  if (s.startsWith('huggingface') || u.includes('huggingface.co') || u.includes('.hf.space')) {
+    return 'huggingface';
+  }
+  if (s.startsWith('api-airforce') || u.includes('api.airforce')) return 'airforce';
+  if (s.startsWith('nvidia-nim') || u.includes('nvidia.com')) return 'nvidia';
+  if (s.startsWith('pollinations') || u.includes('pollinations.ai')) return 'pollinations';
+  if (s.startsWith('siliconflow') || u.includes('siliconflow.cn')) return 'siliconflow';
+  if (s.startsWith('cloudflare') || u.includes('api.cloudflare.com')) return 'cloudflare';
+  if (s.startsWith('wavespeed') || u.includes('wavespeed.ai')) return 'wavespeed';
+  if (s.startsWith('replicate') || u.includes('replicate.com')) return 'replicate';
+  if (s.startsWith('pixabay') || u.includes('pixabay.com')) return 'pixabay';
+  if (s.startsWith('agnes-ai') || u.includes('agnes-ai.com')) return 'agnes';
+  return s || u;
+}
+
+function isProviderConfigured(
+  p: StoredUpstreamProvider,
+  allProviders?: StoredUpstreamProvider[]
+): boolean {
   if (p.adapter === 'sandbox-simulator') return true;
   if (p.usesServerEnv) return Boolean(process.env.GEMINI_API_KEY?.trim());
   if (p.baseUrl.includes('{account_id}') || p.baseUrl.includes('.example.com')) {
     return false;
   }
   if (!p.requiresApiKey) return true;
-  return Boolean(unsealSecret(p.apiKeySealed));
+  if (unsealSecret(p.apiKeySealed)) return true;
+  if (allProviders && allProviders.length > 0) {
+    const vendor = resolveProviderVendorGroup(p);
+    if (vendor === 'huggingface' && process.env.HF_TOKEN?.trim()) return true;
+    return allProviders.some(
+      (other) =>
+        other.id !== p.id &&
+        resolveProviderVendorGroup(other) === vendor &&
+        Boolean(unsealSecret(other.apiKeySealed))
+    );
+  }
+  return false;
 }
 
 function createCatalogProviderEntry(
@@ -141,7 +176,10 @@ function createCatalogProviderEntry(
     verifiedProtocols: spec.verifiedProtocols,
     priority: spec.priority,
     weight: Math.max(10, 100 - spec.priority * 3),
-    timeoutMs: 12000,
+    timeoutMs:
+      spec.baseUrl.includes('.hf.space') || spec.baseUrl.includes('aihorde.net')
+        ? 45000
+        : 18000,
     enabled: !isDisabledByDefault,
     health: configured ? 'healthy' : 'needs_key',
     consecutiveFailures: 0,
@@ -291,8 +329,23 @@ function mergeMissingCatalogProviders(store: StoreSchema): boolean {
         'pollinations-video',
         'pollinations-image-edit',
         'pollinations-sana',
+        'pollinations-image',
         'llm7-io',
         'huggingface-video',
+        'not-lain-rmbg',
+        'bria-rmbg-space',
+        'birefnet-rmbg-space',
+        'flux-kontext-space',
+        'qwen-image-edit-space',
+        'flux-schnell-space',
+        'ltx-video-space',
+        'ic-light-space',
+        'huggingface-rmbg-2',
+        'huggingface-rmbg-products',
+        'api-airforce-image-edit',
+        'api-airforce-image',
+        'api-airforce-video',
+        'ai-horde-image',
       ]);
       if (spec.slug && syncSlugEndpoints.has(spec.slug)) {
         if (existing.baseUrl !== spec.baseUrl) {
@@ -304,7 +357,35 @@ function mergeMissingCatalogProviders(store: StoreSchema): boolean {
           existing.lastError = null;
           existing.consecutiveFailures = 0;
           existing.cooldownUntil = null;
-          existing.health = isProviderConfigured(existing) ? 'healthy' : 'needs_key';
+          existing.health = isProviderConfigured(existing, store.providers)
+            ? 'healthy'
+            : 'needs_key';
+          changed = true;
+        }
+        if (existing.priority !== spec.priority) {
+          existing.priority = spec.priority;
+          changed = true;
+        }
+        const desiredTimeout =
+          spec.baseUrl.includes('.hf.space') || spec.baseUrl.includes('aihorde.net')
+            ? 45000
+            : spec.baseUrl.includes('api.airforce')
+              ? 28000
+              : existing.timeoutMs;
+        if (existing.timeoutMs < desiredTimeout) {
+          existing.timeoutMs = desiredTimeout;
+          changed = true;
+        }
+        if (
+          (spec.baseUrl.includes('.hf.space') ||
+            spec.baseUrl.includes('aihorde.net') ||
+            spec.baseUrl.includes('pollinations.ai')) &&
+          existing.health === 'circuit_open'
+        ) {
+          existing.health = 'healthy';
+          existing.consecutiveFailures = 0;
+          existing.cooldownUntil = null;
+          existing.lastError = null;
           changed = true;
         }
         if (existing.adapter !== spec.adapter) {
@@ -462,7 +543,7 @@ export function toPublicKeyView(k: StoredAccessKey): AccessKeyPublicView {
 export function toPublicProviderView(
   p: StoredUpstreamProvider
 ): UpstreamProviderPublicView {
-  const configured = isProviderConfigured(p);
+  const configured = isProviderConfigured(p, memoryStore?.providers);
   return {
     id: p.id,
     slug: p.slug,

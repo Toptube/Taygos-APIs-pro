@@ -480,3 +480,136 @@ export async function saveCloudRouting(uid: string, routing: RoutingConfig): Pro
     }
   }
 }
+
+export type StudioCraftType = 'macrame' | 'burlap' | 'bags' | 'decor' | 'custom';
+
+export interface CloudStudioProjectMeta {
+  ownerId: string;
+  id: string;
+  title: string;
+  craftType: StudioCraftType;
+  thumbnailDataUrl: string;
+  activePrompt: string;
+  assetCount: number;
+  dimensionCount: number;
+}
+
+const VALID_CRAFT_TYPES: StudioCraftType[] = [
+  'macrame',
+  'burlap',
+  'bags',
+  'decor',
+  'custom',
+];
+
+export async function loadCloudStudioProjects(
+  uid: string
+): Promise<CloudStudioProjectMeta[]> {
+  const safeUid = sanitizeId(uid, 'user');
+  await ensureUserVaultProfile(safeUid);
+  const path = `users/${safeUid}/studioProjects`;
+  const projects: CloudStudioProjectMeta[] = [];
+
+  try {
+    const q = query(
+      collection(db, 'users', safeUid, 'studioProjects'),
+      where('ownerId', '==', safeUid)
+    );
+    const snap = await getDocs(q);
+    snap.forEach((docSnap) => {
+      const d = docSnap.data();
+      if (typeof d?.title === 'string') {
+        const craftType = VALID_CRAFT_TYPES.includes(d.craftType as StudioCraftType)
+          ? (d.craftType as StudioCraftType)
+          : 'macrame';
+        projects.push({
+          ownerId: safeUid,
+          id: typeof d.id === 'string' ? d.id : docSnap.id,
+          title: d.title,
+          craftType,
+          thumbnailDataUrl:
+            typeof d.thumbnailDataUrl === 'string' ? d.thumbnailDataUrl : '',
+          activePrompt: typeof d.activePrompt === 'string' ? d.activePrompt : '',
+          assetCount: clampInt(Number(d.assetCount), 0, 200, 0),
+          dimensionCount: clampInt(Number(d.dimensionCount), 0, 50, 0),
+        });
+      }
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, path);
+  }
+  return projects;
+}
+
+export async function saveCloudStudioProject(
+  uid: string,
+  meta: Omit<CloudStudioProjectMeta, 'ownerId'>
+): Promise<void> {
+  const safeUid = sanitizeId(uid, 'user');
+  const safeProjId = sanitizeId(meta.id, 'proj');
+  const path = `users/${safeUid}/studioProjects/${safeProjId}`;
+  await ensureUserVaultProfile(safeUid);
+
+  const ref = doc(db, 'users', safeUid, 'studioProjects', safeProjId);
+  let snap;
+  try {
+    snap = await getDoc(ref);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+
+  const craftType = VALID_CRAFT_TYPES.includes(meta.craftType)
+    ? meta.craftType
+    : 'macrame';
+
+  const mutableFields = {
+    title: meta.title.trim().slice(0, 120) || 'مشروع استوديو',
+    craftType,
+    thumbnailDataUrl: (meta.thumbnailDataUrl || '').slice(0, 350000),
+    activePrompt: (meta.activePrompt || '').trim().slice(0, 1000),
+    assetCount: clampInt(meta.assetCount, 0, 200, 0),
+    dimensionCount: clampInt(meta.dimensionCount, 0, 50, 0),
+    updatedAt: serverTimestamp(),
+  };
+
+  if (!snap.exists()) {
+    try {
+      await setDoc(ref, {
+        ownerId: safeUid,
+        id: safeProjId,
+        ...mutableFields,
+        createdAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, path);
+    }
+  } else {
+    try {
+      await updateDoc(ref, mutableFields);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  }
+}
+
+export async function deleteCloudStudioProject(
+  uid: string,
+  projectId: string
+): Promise<void> {
+  const safeUid = sanitizeId(uid, 'user');
+  const safeProjId = sanitizeId(projectId, 'proj');
+  const path = `users/${safeUid}/studioProjects/${safeProjId}`;
+  const ref = doc(db, 'users', safeUid, 'studioProjects', safeProjId);
+  let snap;
+  try {
+    snap = await getDoc(ref);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+  if (!snap.exists()) return;
+  try {
+    await deleteDoc(ref);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}

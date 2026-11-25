@@ -18,10 +18,12 @@ import {
   Video,
   X,
 } from 'lucide-react';
+import { SHAMSAWYA_LOGO_URL } from '../lib/studioPresets';
 import type { ImageSpecialty, Language } from '../types/taygos';
 import { useT } from '../i18n/translations';
 
 export type WorkspaceTab =
+  | 'studio'
   | 'home'
   | 'keys'
   | 'providers'
@@ -60,6 +62,7 @@ export const TopBar: React.FC<TopBarProps> = ({
 
   // Horizontal Top Bar (desktop only, without User Guide)
   const topNavItems: { id: WorkspaceTab; label: string }[] = [
+    { id: 'studio', label: t.navStudio },
     { id: 'home', label: t.navHome },
     { id: 'keys', label: t.navKeys },
     { id: 'providers', label: t.navProviders },
@@ -199,6 +202,24 @@ export const TopBar: React.FC<TopBarProps> = ({
               </div>
 
               <nav className="space-y-1">
+                {/* Al-Shamsawya Studio */}
+                <button
+                  type="button"
+                  onClick={() => handleDrawerSelect('studio')}
+                  className={`w-full flex items-center gap-3 px-3 py-2 text-sm font-semibold rounded-lg transition-colors ${
+                    activeTab === 'studio'
+                      ? 'bg-[#0F5C54] text-white'
+                      : 'text-slate-800 hover:bg-slate-50 border border-transparent'
+                  }`}
+                >
+                  <img
+                    src={SHAMSAWYA_LOGO_URL}
+                    alt={t.navStudio}
+                    className="w-5 h-5 object-contain shrink-0"
+                  />
+                  <span className="truncate">{t.navStudio}</span>
+                </button>
+
                 {/* Home */}
                 <button
                   type="button"

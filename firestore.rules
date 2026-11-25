@@ -30,7 +30,12 @@ service cloud.firestore {
     function isOwner(userId) {
       return isVerifiedUser() &&
         request.auth.uid == userId &&
-        request.auth.token.email == 'sambasuony@gmail.com';
+        request.auth.token.email in [
+          'sambasuony@gmail.com',
+          'hmb.top.tube@gmail.com',
+          'tygosibs@gmail.com',
+          'shamscraftagency@gmail.com'
+        ];
     }
 
     function hasValidUserVaultParent(userId) {
@@ -248,6 +253,56 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
+    function isValidStudioProject(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'id',
+          'title',
+          'craftType',
+          'thumbnailDataUrl',
+          'activePrompt',
+          'assetCount',
+          'dimensionCount',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId',
+          'id',
+          'title',
+          'craftType',
+          'thumbnailDataUrl',
+          'activePrompt',
+          'assetCount',
+          'dimensionCount',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.ownerId is string &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.id is string &&
+        isValidId(data.id) &&
+        data.title is string &&
+        data.title.size() >= 1 &&
+        data.title.size() <= 120 &&
+        data.craftType is string &&
+        data.craftType.size() <= 24 &&
+        data.craftType in ['macrame', 'burlap', 'bags', 'decor', 'custom'] &&
+        data.thumbnailDataUrl is string &&
+        data.thumbnailDataUrl.size() <= 350000 &&
+        data.activePrompt is string &&
+        data.activePrompt.size() <= 1000 &&
+        data.assetCount is int &&
+        data.assetCount >= 0 &&
+        data.assetCount <= 200 &&
+        data.dimensionCount is int &&
+        data.dimensionCount >= 0 &&
+        data.dimensionCount <= 50 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     match /users/{userId} {
       allow get: if isOwner(userId) &&
         isValidId(userId) &&
@@ -379,6 +434,44 @@ service cloud.firestore {
         allow delete: if isOwner(userId) &&
           isValidId(userId) &&
           settingId == 'routing' &&
+          (resource == null || existing().ownerId == request.auth.uid);
+      }
+
+      match /studioProjects/{projectId} {
+        allow get: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(projectId) &&
+          (resource == null || existing().ownerId == request.auth.uid);
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(projectId) &&
+          isValidStudioProject(incoming()) &&
+          incoming().id == projectId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidUserVaultParent(userId);
+        allow update: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(projectId) &&
+          isValidStudioProject(incoming()) &&
+          hasValidUserVaultParent(userId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().id == existing().id &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title',
+            'craftType',
+            'thumbnailDataUrl',
+            'activePrompt',
+            'assetCount',
+            'dimensionCount',
+            'updatedAt'
+          ]);
+        allow delete: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(projectId) &&
           (resource == null || existing().ownerId == request.auth.uid);
       }
     }

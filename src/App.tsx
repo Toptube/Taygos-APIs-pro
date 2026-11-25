@@ -8,6 +8,7 @@ import { GatewayPlayground } from './components/GatewayPlayground';
 import { HomeDashboard } from './components/HomeDashboard';
 import { KeysManager } from './components/KeysManager';
 import { ProvidersManager } from './components/ProvidersManager';
+import { ShamsawyaStudio } from './components/studio/ShamsawyaStudio';
 import { TopBar, type WorkspaceTab } from './components/TopBar';
 import { UserGuide } from './components/UserGuide';
 import { useT } from './i18n/translations';
@@ -44,9 +45,28 @@ export default function App() {
   const [authResolved, setAuthResolved] = useState(false);
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const urlParams =
+    typeof window !== 'undefined'
+      ? new URLSearchParams(window.location.search)
+      : null;
+  const pathname =
+    typeof window !== 'undefined' ? window.location.pathname : '/';
+  const requestedMode = urlParams?.get('mode');
+  const isEmbedMode = urlParams?.get('embed') === '1';
+  const isStandaloneStudio =
+    pathname === '/s' ||
+    pathname.startsWith('/s/') ||
+    pathname === '/alshamsawya' ||
+    pathname === '/studio' ||
+    pathname.startsWith('/studio/') ||
+    requestedMode === 'studio' ||
+    isEmbedMode;
+
   const [overview, setOverview] = useState<GatewayOverviewResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>('home');
+  const [loading, setLoading] = useState(!isStandaloneStudio);
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>(
+    requestedMode === 'gateway' ? 'home' : 'home'
+  );
   const [imageSpecialty, setImageSpecialty] = useState<ImageSpecialty>('all');
   const [isCreateKeyOpen, setIsCreateKeyOpen] = useState(false);
   const syncedUidRef = useRef<string | null>(null);
@@ -152,11 +172,13 @@ export default function App() {
             syncedUidRef.current = null;
             setFirebaseUser(null);
             setAdminToken(null);
-            setAuthError(
-              lang === 'ar'
-                ? `الحساب (${user.email || ''}) غير مصرح له. إدارة Taygos APIs مقتصرة على حساب السوبر أدمن فقط.`
-                : `Account (${user.email || ''}) is not authorized. Only the Super Admin Google account can manage Taygos APIs.`
-            );
+            if (!isStandaloneStudio) {
+              setAuthError(
+                lang === 'ar'
+                  ? `الحساب (${user.email || ''}) غير مصرح له. إدارة Taygos APIs مقتصرة على حسابات السوبر أدمن المعتمدة.`
+                  : `Account (${user.email || ''}) is not authorized. Only authorized Super Admin Google accounts can manage Taygos APIs.`
+              );
+            }
             setLoading(false);
             setAuthResolved(true);
             return;
@@ -563,6 +585,18 @@ export default function App() {
     await fetchOverview(token);
   };
 
+  if (isStandaloneStudio) {
+    return (
+      <ShamsawyaStudio
+        lang={lang}
+        onToggleLang={() => setLang((l) => (l === 'ar' ? 'en' : 'ar'))}
+        getBearerToken={getBearerToken}
+        isStandalone
+        isEmbed={isEmbedMode}
+      />
+    );
+  }
+
   if (loading || !authStatus) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center">
@@ -586,24 +620,38 @@ export default function App() {
   const gatewayUrl = overview?.gatewayEndpointUrl ?? '/api/v1/gateway';
   const openaiChatUrl = gatewayUrl.replace(/\/gateway$/, '/chat/completions');
 
-  return (
-    <div className="min-h-screen bg-slate-50 flex flex-col overflow-x-hidden">
-      <TopBar
+  if (activeTab === 'studio') {
+    return (
+      <ShamsawyaStudio
         lang={lang}
-        activeTab={activeTab}
-        imageSpecialty={imageSpecialty}
-        onSelectTab={handleNavigate}
-        onNewKeyClick={() => {
-          handleNavigate('keys');
-          setIsCreateKeyOpen(true);
-        }}
         onToggleLang={() => setLang((l) => (l === 'ar' ? 'en' : 'ar'))}
-        onSignOut={handleSignOut}
+        getBearerToken={getBearerToken}
+        isEmbed={isEmbedMode}
+        onOpenGatewaySettings={() => handleNavigate('home')}
       />
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-[#F8F7F4] flex flex-col overflow-x-hidden">
+      {!isEmbedMode && (
+        <TopBar
+          lang={lang}
+          activeTab={activeTab}
+          imageSpecialty={imageSpecialty}
+          onSelectTab={handleNavigate}
+          onNewKeyClick={() => {
+            handleNavigate('keys');
+            setIsCreateKeyOpen(true);
+          }}
+          onToggleLang={() => setLang((l) => (l === 'ar' ? 'en' : 'ar'))}
+          onSignOut={handleSignOut}
+        />
+      )}
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-3.5 sm:px-6 py-4 sm:py-5 space-y-5">
-        {/* Compact Single-Strip Utility & KPI Bar (Shown on inner tabs so Home stays direct & top-focused) */}
-        {activeTab !== 'home' && (
+        {/* Compact Single-Strip Utility & KPI Bar (Shown on Gateway inner tabs so Home stays clean) */}
+        {!isEmbedMode && activeTab !== 'home' && (
           <div className="bg-white border border-slate-200 rounded-xl px-3.5 sm:px-4 py-3 space-y-2.5">
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
             <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2.5 sm:gap-4 min-w-0 text-xs">
@@ -736,7 +784,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Active Standalone Page View */}
         {!overview ? (
           <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-sm text-slate-500">
             Loading workspace...
@@ -833,14 +880,16 @@ export default function App() {
         )}
       </main>
 
-      <footer className="border-t border-slate-200 bg-white mt-auto">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-center sm:justify-between text-xs text-slate-500">
-          <span>Taygos APIs · Unified Gateway &amp; Perpetual Key Control</span>
-          <span className="hidden sm:inline text-slate-400">
-            Text · Image · Video · Audio · PDF Auto-Failover
-          </span>
-        </div>
-      </footer>
+      {!isEmbedMode && (
+        <footer className="border-t border-slate-200 bg-white mt-auto">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-center sm:justify-between text-xs text-slate-500">
+            <span>استوديو الشمساوية · الشمس كرافت × Taygos APIs</span>
+            <span className="hidden sm:inline text-slate-400">
+              Studio · Text · Image · Video · Audio · PDF Auto-Failover
+            </span>
+          </div>
+        </footer>
+      )}
     </div>
   );
 }

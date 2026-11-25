@@ -2,19 +2,24 @@ import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import {
   authenticateGatewayRequest,
+  createGeminiClient,
   executeUnifiedGateway,
   probeUpstreamProvider,
+  resolveProviderApiKey,
 } from './server/gateway.ts';
 import {
   assertSafeUpstreamUrl,
   createAdminSessionToken,
+  createStudioBridgeToken,
   hasPersistentMasterKey,
   maskCredential,
   sealSecret,
   verifyAdminSessionToken,
+  verifyStudioBridgeToken,
 } from './server/security.ts';
 import {
   isFirebaseAuthConfigured,
@@ -34,6 +39,7 @@ import {
   toPublicProviderView,
   verifyAdminPasscode,
   createAccessKeyRecord,
+  type StoredAccessKey,
 } from './server/store.ts';
 import type {
   ProviderAdapter,
@@ -86,6 +92,98 @@ function getBaseOrigin(req: Request): string {
   return `${proto}://${host}`;
 }
 
+function isStudioPagePath(urlPath: string): boolean {
+  const clean = (urlPath.split('?')[0] || '/').replace(/\/+$/, '') || '/';
+  return (
+    clean === '/s' ||
+    clean.startsWith('/s/') ||
+    clean === '/alshamsawya' ||
+    clean === '/studio' ||
+    clean.startsWith('/studio/')
+  );
+}
+
+function escapeHtmlAttr(val: string): string {
+  return val
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function injectStudioSocialMeta(html: string, origin: string): string {
+  const cleanOrigin = origin.replace(/\/+$/, '');
+  const canonicalUrl = `${cleanOrigin}/s`;
+  const logoUrl = `${cleanOrigin}/assets/aistudio/brand_icon_dark_e73bb75b.png`;
+  const title = 'استوديو الشمساوية | تصميم وتصوير المنتجات بالذكاء الاصطناعي';
+  const desc =
+    'استوديو ذكي لتصوير وعزل خلفيات منتجات الهاند ميد والمكرمية والخيش وتوليد المشاهد وفيديوهات الريلز بالذكاء الاصطناعي.';
+
+  const schemaJson = JSON.stringify({
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareApplication',
+    name: 'استوديو الشمساوية | Al-Shamsawya AI Studio',
+    applicationCategory: 'MultimediaApplication',
+    operatingSystem: 'Web',
+    url: canonicalUrl,
+    image: logoUrl,
+    description: desc,
+  }).replace(/<\/script/gi, '<\\/script');
+
+  const studioMetaBlock = `
+    <title>${escapeHtmlAttr(title)}</title>
+    <meta name="description" content="${escapeHtmlAttr(desc)}" />
+    <link rel="canonical" href="${escapeHtmlAttr(canonicalUrl)}" />
+    <link rel="icon" type="image/png" href="${escapeHtmlAttr(logoUrl)}" />
+    <link rel="apple-touch-icon" href="${escapeHtmlAttr(logoUrl)}" />
+    <meta property="og:site_name" content="استوديو الشمساوية" />
+    <meta property="og:title" content="${escapeHtmlAttr(title)}" />
+    <meta property="og:description" content="${escapeHtmlAttr(desc)}" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="${escapeHtmlAttr(canonicalUrl)}" />
+    <meta property="og:image" content="${escapeHtmlAttr(logoUrl)}" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:alt" content="شعار استوديو الشمساوية" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="${escapeHtmlAttr(title)}" />
+    <meta name="twitter:description" content="${escapeHtmlAttr(desc)}" />
+    <meta name="twitter:image" content="${escapeHtmlAttr(logoUrl)}" />
+    <script type="application/ld+json">${schemaJson}</script>
+  `;
+
+  return html
+    .replace(/<title>[\s\S]*?<\/title>/i, '')
+    .replace(/<meta\s+(?:name|property)="(?:description|og:[^"]+|twitter:[^"]+)"[^>]*>/gi, '')
+    .replace(/<link\s+rel="(?:icon|apple-touch-icon|canonical)"[^>]*>/gi, '')
+    .replace('</head>', `${studioMetaBlock}\n  </head>`);
+}
+
+function extractMediaFromGatewayResult(data: unknown): string {
+  const obj = data as Record<string, unknown> | undefined;
+  const arr = Array.isArray(obj?.data) ? obj.data : [];
+  const first = arr[0] as Record<string, unknown> | undefined;
+  if (typeof first?.url === 'string' && first.url) return first.url;
+  if (typeof first?.b64_json === 'string' && first.b64_json) {
+    return `data:image/png;base64,${first.b64_json}`;
+  }
+  if (typeof obj?.dataUrl === 'string' && obj.dataUrl) return obj.dataUrl;
+  if (typeof obj?.url === 'string' && obj.url) return obj.url;
+  return '';
+}
+
+function resolveAnyGeminiApiKey(): string {
+  const envKey = process.env.GEMINI_API_KEY?.trim();
+  if (envKey) return envKey;
+  const store = getStore();
+  for (const p of store.providers) {
+    if (p.enabled && p.adapter === 'gemini') {
+      const k = resolveProviderApiKey(p);
+      if (k) return k;
+    }
+  }
+  return '';
+}
+
 async function startServer(): Promise<void> {
   // Sync latest catalog providers on startup
   getStore();
@@ -94,7 +192,7 @@ async function startServer(): Promise<void> {
 
   app.use(
     express.json({
-      limit: '1mb',
+      limit: '25mb',
       verify: (req, _res, buf) => {
         (req as RawBodyRequest).rawBody = buf.toString('utf8');
       },
@@ -1310,6 +1408,602 @@ async function startServer(): Promise<void> {
     res.json({ ok: true });
   });
 
+  // =========================================================================
+  // AL-SHAMSAWYA STUDIO ENDPOINTS (Powered by Taygos Full Cascade Engine)
+  // =========================================================================
+  app.use('/api/studio', (req, res, next) => {
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
+    const allowOrigin =
+      origin === 'https://alshamsawiyah.ai.studio' ||
+      origin.endsWith('.run.app') ||
+      origin.startsWith('http://localhost:')
+        ? origin
+        : '*';
+    res.setHeader('Access-Control-Allow-Origin', allowOrigin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization, X-Studio-Token, X-Taygos-Public-Key, X-Taygos-Secret-Key, X-Taygos-Timestamp, X-Taygos-Signature'
+    );
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  app.get('/api/studio/session', (req: Request, res: Response) => {
+    const studioToken = createStudioBridgeToken(60 * 60 * 24);
+    const origin = getBaseOrigin(req);
+    res.json({
+      ok: true,
+      studioToken,
+      shortStudioUrl: `${origin}/s`,
+      studioUrl: `${origin}/studio`,
+      studioEmbedUrl: `${origin}/studio?embed=1`,
+      allowedEmbedOrigin: 'https://alshamsawiyah.ai.studio',
+    });
+  });
+
+  async function resolveStudioCaller(
+    req: RawBodyRequest
+  ): Promise<{ key: StoredAccessKey; authMethod: 'key_pair' | 'hmac_sha256' | 'bearer_pair' } | null> {
+    const token = extractBearerToken(req);
+    const studioHeaderToken =
+      typeof req.headers['x-studio-token'] === 'string'
+        ? req.headers['x-studio-token'].trim()
+        : '';
+
+    const isAuthorizedStudio =
+      verifyAdminSessionToken(token) ||
+      verifyStudioBridgeToken(token) ||
+      verifyStudioBridgeToken(studioHeaderToken) ||
+      Boolean(await verifyFirebaseAdminBearer(token));
+
+    if (isAuthorizedStudio) {
+      const virtualStudioKey: StoredAccessKey = {
+        id: 'shamsawya_studio_internal',
+        name: 'Al-Shamsawya Studio',
+        description: 'Internal Studio Gateway Session',
+        publicKey: 'taygos_studio_internal',
+        secretMasked: 'studio-session',
+        secretHash: '',
+        hmacSealedSecret: '',
+        perpetual: true,
+        expiresAt: null,
+        scopes: ['studio:execute', 'gateway:execute'],
+        requireHmac: false,
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        lastUsedAt: null,
+        requestCount: 0,
+        failoverCount: 0,
+      };
+      return { key: virtualStudioKey, authMethod: 'bearer_pair' };
+    }
+
+    const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
+    const gwAuth = authenticateGatewayRequest(req.headers, rawBody);
+    if (gwAuth.ok && gwAuth.key && gwAuth.authMethod) {
+      return { key: gwAuth.key, authMethod: gwAuth.authMethod };
+    }
+    return null;
+  }
+
+  app.get('/api/studio/cascade-status', async (req: RawBodyRequest, res: Response) => {
+    const caller = await resolveStudioCaller(req);
+    if (!caller) {
+      res.status(401).json({ error: 'Unauthorized studio session.' });
+      return;
+    }
+    const store = getStore();
+    const providers = store.providers.map(toPublicProviderView);
+    const origin = getBaseOrigin(req);
+    res.json({
+      ok: true,
+      routing: store.routing,
+      providers,
+      endpoints: {
+        shortStudioUrl: `${origin}/s`,
+        studioUrl: `${origin}/studio`,
+        studioEmbedUrl: `${origin}/studio?embed=1`,
+        gatewayUrl: `${origin}/api/v1/gateway`,
+      },
+    });
+  });
+
+  app.post('/api/studio/remove-bg', async (req: RawBodyRequest, res: Response) => {
+    const caller = await resolveStudioCaller(req);
+    if (!caller) {
+      res.status(401).json({ ok: false, error: 'Unauthorized studio session.' });
+      return;
+    }
+    const image = typeof req.body?.image === 'string' ? req.body.image : '';
+    if (!image) {
+      res.status(400).json({ ok: false, error: 'Image data is required.' });
+      return;
+    }
+    const result = await executeUnifiedGateway({
+      key: caller.key,
+      authMethod: caller.authMethod,
+      category: 'image',
+      allowSandbox: false,
+      fullCascade: true,
+      payload: {
+        task: 'bg_removal',
+        image,
+        prompt:
+          'Remove the background completely and cleanly isolate the handmade craft product on a pure solid white or transparent background, preserving 100% of macrame knots, cotton fibers, burlap weave, wood beads, and fine fringe edges without altering the product.',
+      },
+    });
+    res.status(result.httpStatus).json(result.body);
+  });
+
+  app.post('/api/studio/generate-scene', async (req: RawBodyRequest, res: Response) => {
+    const caller = await resolveStudioCaller(req);
+    if (!caller) {
+      res.status(401).json({ ok: false, error: 'Unauthorized studio session.' });
+      return;
+    }
+    const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
+    if (!prompt) {
+      res.status(400).json({ ok: false, error: 'Prompt is required.' });
+      return;
+    }
+    const image = typeof req.body?.image === 'string' ? req.body.image : undefined;
+    const mode = req.body?.mode === 'bg_edit' && image ? 'bg_edit' : 'generate';
+    const result = await executeUnifiedGateway({
+      key: caller.key,
+      authMethod: caller.authMethod,
+      category: 'image',
+      allowSandbox: false,
+      fullCascade: true,
+      payload: {
+        task: mode,
+        prompt,
+        ...(image && mode === 'bg_edit' ? { image } : {}),
+        width: Number(req.body?.width) || 1024,
+        height: Number(req.body?.height) || 1024,
+      },
+    });
+    res.status(result.httpStatus).json(result.body);
+  });
+
+  app.post('/api/studio/copywriter', async (req: RawBodyRequest, res: Response) => {
+    const caller = await resolveStudioCaller(req);
+    if (!caller) {
+      res.status(401).json({ ok: false, error: 'Unauthorized studio session.' });
+      return;
+    }
+    const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
+    if (!prompt) {
+      res.status(400).json({ ok: false, error: 'Prompt is required.' });
+      return;
+    }
+    const result = await executeUnifiedGateway({
+      key: caller.key,
+      authMethod: caller.authMethod,
+      category: 'llm',
+      allowSandbox: false,
+      fullCascade: true,
+      payload: { prompt },
+    });
+    res.status(result.httpStatus).json(result.body);
+  });
+
+  app.post('/api/studio/video', async (req: RawBodyRequest, res: Response) => {
+    const caller = await resolveStudioCaller(req);
+    if (!caller) {
+      res.status(401).json({ ok: false, error: 'Unauthorized studio session.' });
+      return;
+    }
+    const mode = typeof req.body?.mode === 'string' ? req.body.mode : 'text-to-video';
+    const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
+    const startImage = typeof req.body?.startImage === 'string' ? req.body.startImage : '';
+    const endImage = typeof req.body?.endImage === 'string' ? req.body.endImage : '';
+    const aspectRatio = req.body?.aspectRatio === '9:16' ? '9:16' : '16:9';
+    const duration = typeof req.body?.duration === 'string' ? req.body.duration : '5';
+
+    if (!prompt && !startImage) {
+      res.status(400).json({ ok: false, error: 'Provide a text prompt or start frame image.' });
+      return;
+    }
+
+    const result = await executeUnifiedGateway({
+      key: caller.key,
+      authMethod: caller.authMethod,
+      category: 'video',
+      allowSandbox: false,
+      fullCascade: true,
+      payload: {
+        mode,
+        prompt:
+          prompt ||
+          'Smooth commercial showcase animation of a handcrafted Egyptian macrame and burlap artisan product with warm natural studio light, preserving all original craft textures.',
+        start_image: startImage || undefined,
+        end_image: endImage || undefined,
+        aspect_ratio: aspectRatio,
+        duration,
+      },
+    });
+    res.status(result.httpStatus).json(result.body);
+  });
+
+  app.post('/api/studio/ai-magic', async (req: RawBodyRequest, res: Response) => {
+    const caller = await resolveStudioCaller(req);
+    if (!caller) {
+      res.status(401).json({ ok: false, error: 'Unauthorized studio session.' });
+      return;
+    }
+
+    const userPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
+    const imageRaw = typeof req.body?.image === 'string' ? req.body.image.trim() : '';
+    const desiredAction =
+      typeof req.body?.desiredAction === 'string' ? req.body.desiredAction : 'auto';
+    const aspectRatio = req.body?.aspectRatio === '9:16' ? '9:16' : '16:9';
+
+    if (!userPrompt && !imageRaw) {
+      res.status(400).json({ ok: false, error: 'Provide an image or prompt.' });
+      return;
+    }
+
+    interface VisionPlan {
+      action: 'cutout' | 'scene_edit' | 'scene_composite' | 'lighting' | 'video';
+      productTitleAr: string;
+      placement: 'wall_hanging' | 'tabletop' | 'handheld' | 'flatlay';
+      editPromptEn: string;
+      backdropPromptEn: string;
+      videoPromptEn: string;
+      lightingAdjust: {
+        brightness: number;
+        contrast: number;
+        saturation: number;
+        warmth: number;
+        clarity: number;
+      };
+      shadowPreset: {
+        enabled: boolean;
+        opacity: number;
+        blur: number;
+        offsetY: number;
+        spread: number;
+      };
+      replyAr: string;
+    }
+
+    const defaultPromptText =
+      userPrompt ||
+      'Place this handmade product cleanly in a warm sunlit Egyptian bohemian interior with realistic shadows and natural lighting.';
+
+    let visionPlan: VisionPlan = {
+      action:
+        desiredAction !== 'auto'
+          ? (desiredAction as VisionPlan['action'])
+          : /فيديو|ريلز|تحريك|video|animate|reel/i.test(defaultPromptText)
+            ? 'video'
+            : /عزل|تفريغ|بدون خلفية|remove bg|cutout|شفاف/i.test(defaultPromptText)
+              ? 'cutout'
+              : /إضاءة|اضاءة|تفتيح|تعديل لون|bright|light/i.test(defaultPromptText) &&
+                  !/خلفية|مشهد|صالون|مكان|حط|ضع|ترابيزة|حائط|scene|background/i.test(defaultPromptText)
+                ? 'lighting'
+                : 'scene_edit',
+      productTitleAr: 'منتج هاند ميد من الشمس كرافت',
+      placement: 'wall_hanging',
+      editPromptEn: `Place the exact handmade product from the photo naturally into the requested scene: ${defaultPromptText}. Keep every cotton knot, wooden bead, burlap texture, shape, and color 100% identical to the original item, realistic shadows and studio lighting.`,
+      backdropPromptEn: `Ultra-realistic commercial interior backdrop for a handmade craft product: ${defaultPromptText}. Keep center area clean and uncluttered for product placement, soft natural daylight, warm limestone and wood tones.`,
+      videoPromptEn: `Smooth commercial showcase video of this handmade craft item: ${defaultPromptText}. Gentle slow camera push-in, warm sunlight sweep, crisp fabric and cord details.`,
+      lightingAdjust: {
+        brightness: 6,
+        contrast: 8,
+        saturation: 4,
+        warmth: 8,
+        clarity: 20,
+      },
+      shadowPreset: {
+        enabled: true,
+        opacity: 0.28,
+        blur: 24,
+        offsetY: 16,
+        spread: 0.72,
+      },
+      replyAr: 'تم تحليل طلبك وتجهيز المشهد بالذكاء الاصطناعي.',
+    };
+
+    // Multimodal Vision Director using Gemini (gemini-4-hydrogen)
+    const geminiKey = resolveAnyGeminiApiKey();
+    const imgMatch = imageRaw.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    if (geminiKey) {
+      try {
+        const ai = createGeminiClient(geminiKey);
+        const directorParts: Array<{
+          text?: string;
+          inlineData?: { data: string; mimeType: string };
+        }> = [];
+        if (imgMatch) {
+          directorParts.push({
+            inlineData: {
+              mimeType: imgMatch[1],
+              data: imgMatch[2],
+            },
+          });
+        }
+        directorParts.push({
+          text: `You are the AI Creative Director inside Al-Shamsawya Studio (استوديو الشمساوية) for Egyptian handmade products (macrame wall hangings, burlap bags, woven mirrors, boho decor).
+Inspect the product image carefully and read the user's request (${desiredAction !== 'auto' ? `User explicitly clicked button: "${desiredAction}"` : 'auto-detect best action from request'}):
+User prompt: "${defaultPromptText}"
+
+Rules:
+1. If user asks to remove/isolate background -> action="cutout".
+2. If user asks for a video / reel / motion -> action="video".
+3. If user ONLY asks to brighten/enhance colors/lighting without changing background -> action="lighting".
+4. Otherwise (placing product on a wall, living room, table, boutique, hands, etc.) -> action="scene_edit" (unless desiredAction forces "scene_composite").
+5. Detect true physical placement from the product shape:
+   - Wall hanging macrame or mirror -> placement="wall_hanging" (must hang naturally on wall with a subtle wooden peg/nail, shadow behind it, NOT standing on a floor).
+   - Bag / basket / vase / tray -> placement="tabletop" (resting naturally on table/pedestal with soft bottom contact shadow).
+   - Hand-held accessory -> placement="handheld".
+6. Write "editPromptEn" in rich English for FLUX.1-Kontext image editing so it preserves 100% of the exact product item from the photo and places it accurately.
+7. Write "backdropPromptEn" in English for generating an empty background behind a cutout if needed (matching the placement geometry!).
+8. Write "replyAr" in warm, helpful Egyptian Arabic explaining what was done (1 short sentence).`,
+        });
+
+        const visionRes = await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: { parts: directorParts },
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                action: {
+                  type: Type.STRING,
+                  enum: ['cutout', 'scene_edit', 'scene_composite', 'lighting', 'video'],
+                },
+                productTitleAr: { type: Type.STRING },
+                placement: {
+                  type: Type.STRING,
+                  enum: ['wall_hanging', 'tabletop', 'handheld', 'flatlay'],
+                },
+                editPromptEn: { type: Type.STRING },
+                backdropPromptEn: { type: Type.STRING },
+                videoPromptEn: { type: Type.STRING },
+                lightingAdjust: {
+                  type: Type.OBJECT,
+                  properties: {
+                    brightness: { type: Type.NUMBER },
+                    contrast: { type: Type.NUMBER },
+                    saturation: { type: Type.NUMBER },
+                    warmth: { type: Type.NUMBER },
+                    clarity: { type: Type.NUMBER },
+                  },
+                  required: ['brightness', 'contrast', 'saturation', 'warmth', 'clarity'],
+                },
+                shadowPreset: {
+                  type: Type.OBJECT,
+                  properties: {
+                    enabled: { type: Type.BOOLEAN },
+                    opacity: { type: Type.NUMBER },
+                    blur: { type: Type.NUMBER },
+                    offsetY: { type: Type.NUMBER },
+                    spread: { type: Type.NUMBER },
+                  },
+                  required: ['enabled', 'opacity', 'blur', 'offsetY', 'spread'],
+                },
+                replyAr: { type: Type.STRING },
+              },
+              required: [
+                'action',
+                'productTitleAr',
+                'placement',
+                'editPromptEn',
+                'backdropPromptEn',
+                'videoPromptEn',
+                'lightingAdjust',
+                'shadowPreset',
+                'replyAr',
+              ],
+            },
+          },
+        });
+
+        const parsedText = visionRes.text?.trim();
+        if (parsedText) {
+          const parsedPlan = JSON.parse(parsedText) as VisionPlan;
+          if (desiredAction !== 'auto') {
+            parsedPlan.action = desiredAction as VisionPlan['action'];
+          }
+          visionPlan = parsedPlan;
+        }
+      } catch {
+        // Keep deterministic visionPlan fallback cleanly
+      }
+    }
+
+    const traces: unknown[] = [];
+
+    if (visionPlan.action === 'lighting') {
+      res.json({
+        ok: true,
+        action: 'lighting',
+        visionPlan,
+        traces,
+      });
+      return;
+    }
+
+    if (visionPlan.action === 'cutout') {
+      const rmbg = await executeUnifiedGateway({
+        key: caller.key,
+        authMethod: caller.authMethod,
+        category: 'image',
+        allowSandbox: false,
+        fullCascade: true,
+        payload: {
+          task: 'bg_removal',
+          image: imageRaw,
+          prompt: 'Isolate product cleanly with crisp transparent PNG background.',
+        },
+      });
+      traces.push(rmbg.body);
+      const cutoutImageUrl = rmbg.body.ok ? extractMediaFromGatewayResult(rmbg.body.data) : '';
+      if (!cutoutImageUrl) {
+        res.status(rmbg.httpStatus || 502).json({
+          ok: false,
+          action: 'cutout',
+          visionPlan,
+          traces,
+          error: rmbg.body.error || 'Cutout providers unavailable right now.',
+        });
+        return;
+      }
+      res.json({
+        ok: true,
+        action: 'cutout',
+        cutoutImageUrl,
+        visionPlan,
+        provider: rmbg.body.provider,
+        totalLatencyMs: rmbg.body.totalLatencyMs,
+        traces,
+      });
+      return;
+    }
+
+    if (visionPlan.action === 'video') {
+      const vidRes = await executeUnifiedGateway({
+        key: caller.key,
+        authMethod: caller.authMethod,
+        category: 'video',
+        allowSandbox: false,
+        fullCascade: true,
+        payload: {
+          mode: imageRaw ? 'image-to-video' : 'text-to-video',
+          prompt: visionPlan.videoPromptEn,
+          start_image: imageRaw || undefined,
+          aspect_ratio: aspectRatio,
+          duration: '4',
+        },
+      });
+      traces.push(vidRes.body);
+      const videoUrl = vidRes.body.ok ? extractMediaFromGatewayResult(vidRes.body.data) : '';
+      if (!videoUrl) {
+        res.status(vidRes.httpStatus || 502).json({
+          ok: false,
+          action: 'video',
+          visionPlan,
+          traces,
+          error: vidRes.body.error || 'Video AI providers unavailable right now.',
+        });
+        return;
+      }
+      res.json({
+        ok: true,
+        action: 'video',
+        videoUrl,
+        visionPlan,
+        provider: vidRes.body.provider,
+        totalLatencyMs: vidRes.body.totalLatencyMs,
+        traces,
+      });
+      return;
+    }
+
+    if (visionPlan.action === 'scene_edit' && imageRaw) {
+      const editRes = await executeUnifiedGateway({
+        key: caller.key,
+        authMethod: caller.authMethod,
+        category: 'image',
+        allowSandbox: false,
+        fullCascade: true,
+        payload: {
+          task: 'bg_edit',
+          image: imageRaw,
+          prompt: visionPlan.editPromptEn,
+          width: 1024,
+          height: 1024,
+        },
+      });
+      traces.push(editRes.body);
+      const editedFullImageUrl = editRes.body.ok
+        ? extractMediaFromGatewayResult(editRes.body.data)
+        : '';
+      if (editedFullImageUrl) {
+        res.json({
+          ok: true,
+          action: 'scene_edit',
+          editedFullImageUrl,
+          visionPlan,
+          provider: editRes.body.provider,
+          totalLatencyMs: editRes.body.totalLatencyMs,
+          traces,
+        });
+        return;
+      }
+      // Graceful automatic fallback: isolate product + generate AI scene backdrop!
+      visionPlan.action = 'scene_composite';
+    }
+
+    // scene_composite: run bg_removal + backdrop generation in parallel when image exists!
+    const [rmbgRes, sceneRes] = await Promise.all([
+      imageRaw
+        ? executeUnifiedGateway({
+            key: caller.key,
+            authMethod: caller.authMethod,
+            category: 'image',
+            allowSandbox: false,
+            fullCascade: true,
+            payload: {
+              task: 'bg_removal',
+              image: imageRaw,
+              prompt: 'Clean product cutout.',
+            },
+          })
+        : Promise.resolve(null),
+      executeUnifiedGateway({
+        key: caller.key,
+        authMethod: caller.authMethod,
+        category: 'image',
+        allowSandbox: false,
+        fullCascade: true,
+        payload: {
+          task: 'generate',
+          prompt: visionPlan.backdropPromptEn,
+          width: 1024,
+          height: 1024,
+        },
+      }),
+    ]);
+
+    if (rmbgRes) traces.push(rmbgRes.body);
+    traces.push(sceneRes.body);
+
+    const cutoutImageUrl =
+      rmbgRes && rmbgRes.body.ok ? extractMediaFromGatewayResult(rmbgRes.body.data) : '';
+    const sceneImageUrl = sceneRes.body.ok
+      ? extractMediaFromGatewayResult(sceneRes.body.data)
+      : '';
+
+    if (!sceneImageUrl && !cutoutImageUrl) {
+      res.status(502).json({
+        ok: false,
+        action: 'scene_composite',
+        visionPlan,
+        traces,
+        error: sceneRes.body.error || 'AI scene generation providers are busy right now.',
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      action: 'scene_composite',
+      cutoutImageUrl: cutoutImageUrl || undefined,
+      sceneImageUrl: sceneImageUrl || undefined,
+      visionPlan,
+      provider: sceneRes.body.provider,
+      totalLatencyMs: sceneRes.body.totalLatencyMs,
+      traces,
+    });
+  });
+
   // Vite Dev Middleware or Static Production Build
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
@@ -1317,13 +2011,34 @@ async function startServer(): Promise<void> {
       server: { middlewareMode: true },
       appType: 'spa',
     });
+    app.get('*', async (req, res, next) => {
+      if (!isStudioPagePath(req.originalUrl) || req.path.startsWith('/api')) {
+        next();
+        return;
+      }
+      try {
+        const rawHtml = fs.readFileSync(path.resolve(process.cwd(), 'index.html'), 'utf8');
+        const transformed = await vite.transformIndexHtml(req.originalUrl, rawHtml);
+        const withStudioMeta = injectStudioSocialMeta(transformed, getBaseOrigin(req));
+        res.status(200).set({ 'Content-Type': 'text/html; charset=utf-8' }).end(withStudioMeta);
+      } catch (err) {
+        next(err);
+      }
+    });
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     if (fs.existsSync(distDir)) {
-      app.use(express.static(distDir));
-      app.get('*', (_req, res) => {
-        res.sendFile(path.join(distDir, 'index.html'));
+      app.use(express.static(distDir, { index: false }));
+      app.get('*', (req, res) => {
+        const indexPath = path.join(distDir, 'index.html');
+        if (isStudioPagePath(req.originalUrl) && fs.existsSync(indexPath)) {
+          const rawHtml = fs.readFileSync(indexPath, 'utf8');
+          const withStudioMeta = injectStudioSocialMeta(rawHtml, getBaseOrigin(req));
+          res.status(200).set({ 'Content-Type': 'text/html; charset=utf-8' }).end(withStudioMeta);
+          return;
+        }
+        res.sendFile(indexPath);
       });
     }
   }

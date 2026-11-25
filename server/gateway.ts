@@ -148,14 +148,51 @@ export function authenticateGatewayRequest(
   };
 }
 
+function resolveGatewayVendorGroup(p: {
+  slug?: string;
+  baseUrl: string;
+}): string {
+  const s = (p.slug || '').toLowerCase();
+  const u = (p.baseUrl || '').toLowerCase();
+  if (s.startsWith('huggingface') || u.includes('huggingface.co') || u.includes('.hf.space')) {
+    return 'huggingface';
+  }
+  if (s.startsWith('api-airforce') || u.includes('api.airforce')) return 'airforce';
+  if (s.startsWith('nvidia-nim') || u.includes('nvidia.com')) return 'nvidia';
+  if (s.startsWith('pollinations') || u.includes('pollinations.ai')) return 'pollinations';
+  if (s.startsWith('siliconflow') || u.includes('siliconflow.cn')) return 'siliconflow';
+  if (s.startsWith('cloudflare') || u.includes('api.cloudflare.com')) return 'cloudflare';
+  if (s.startsWith('wavespeed') || u.includes('wavespeed.ai')) return 'wavespeed';
+  if (s.startsWith('replicate') || u.includes('replicate.com')) return 'replicate';
+  if (s.startsWith('pixabay') || u.includes('pixabay.com')) return 'pixabay';
+  if (s.startsWith('agnes-ai') || u.includes('agnes-ai.com')) return 'agnes';
+  return s || u;
+}
+
 export function resolveProviderApiKey(provider: StoredUpstreamProvider): string {
   if (provider.usesServerEnv) {
     return process.env.GEMINI_API_KEY?.trim() ?? '';
   }
-  return unsealSecret(provider.apiKeySealed) ?? '';
+  const direct = unsealSecret(provider.apiKeySealed) ?? '';
+  if (direct) return direct;
+
+  const vendor = resolveGatewayVendorGroup(provider);
+  if (vendor === 'huggingface' && process.env.HF_TOKEN?.trim()) {
+    return process.env.HF_TOKEN.trim();
+  }
+  const store = getStore();
+  for (const sibling of store.providers) {
+    if (sibling.id === provider.id) continue;
+    if (resolveGatewayVendorGroup(sibling) !== vendor) continue;
+    const siblingKey = sibling.usesServerEnv
+      ? process.env.GEMINI_API_KEY?.trim() ?? ''
+      : unsealSecret(sibling.apiKeySealed) ?? '';
+    if (siblingKey) return siblingKey;
+  }
+  return '';
 }
 
-function createGeminiClient(apiKey: string): GoogleGenAI {
+export function createGeminiClient(apiKey: string): GoogleGenAI {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -210,6 +247,338 @@ function buildOpenAICompletionsUrl(baseUrl: string): string {
   return `${clean}/v1/chat/completions`;
 }
 
+async function resolveImageBytes(
+  rawInput: unknown
+): Promise<{ buffer: Buffer; mimeType: string; base64: string } | null> {
+  if (typeof rawInput !== 'string' || !rawInput.trim()) return null;
+  const trimmed = rawInput.trim();
+  const dataMatch = trimmed.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (dataMatch) {
+    const mimeType = dataMatch[1];
+    const base64 = dataMatch[2];
+    return {
+      buffer: Buffer.from(base64, 'base64'),
+      mimeType,
+      base64,
+    };
+  }
+  if (trimmed.startsWith('https://')) {
+    const safeUrl = await assertSafeUpstreamUrl(trimmed);
+    const res = await fetch(safeUrl.toString());
+    if (!res.ok) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    const mimeType = res.headers.get('content-type')?.split(';')[0] || 'image/png';
+    return {
+      buffer: buf,
+      mimeType,
+      base64: buf.toString('base64'),
+    };
+  }
+  return null;
+}
+
+interface GradioFileData {
+  path: string;
+  url: string;
+  orig_name: string;
+  mime_type: string;
+  is_stream: boolean;
+  meta: { _type: string };
+}
+
+function buildGradioMediaUrl(spaceBaseUrl: string, item: unknown): string {
+  if (!item || typeof item !== 'object') return '';
+  const obj = item as Record<string, unknown>;
+  if (obj.video && typeof obj.video === 'object') {
+    const inner = buildGradioMediaUrl(spaceBaseUrl, obj.video);
+    if (inner) return inner;
+  }
+  if (typeof obj.url === 'string' && obj.url.startsWith('http')) {
+    return obj.url;
+  }
+  if (typeof obj.path === 'string' && obj.path) {
+    return `${spaceBaseUrl.replace(/\/+$/, '')}/gradio_api/file=${obj.path}`;
+  }
+  return '';
+}
+
+function extractGradioOutputMediaUrl(
+  spaceBaseUrl: string,
+  parsedData: unknown[],
+  preferCutoutOutput = false
+): string {
+  if (!Array.isArray(parsedData) || parsedData.length === 0) return '';
+
+  // For RMBG spaces: BRIA returns [[orig_slider, cutout_slider], no_bg_image.png]
+  // Other spaces return [[orig_slider, cutout_slider]]
+  if (preferCutoutOutput) {
+    // 1. Look specifically for explicit no_bg_image PNG output
+    for (let i = parsedData.length - 1; i >= 0; i--) {
+      const item = parsedData[i];
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        const rec = item as Record<string, unknown>;
+        const orig = typeof rec.orig_name === 'string' ? rec.orig_name.toLowerCase() : '';
+        const p = typeof rec.path === 'string' ? rec.path.toLowerCase() : '';
+        if (orig.includes('no_bg') || p.includes('no_bg') || p.endsWith('.png')) {
+          const url = buildGradioMediaUrl(spaceBaseUrl, item);
+          if (url) return url;
+        }
+      }
+    }
+    // 2. If slider tuple [before, after], always pick index 1 (after cutout!)
+    for (const item of parsedData) {
+      if (Array.isArray(item) && item.length >= 2) {
+        const afterUrl = buildGradioMediaUrl(spaceBaseUrl, item[1]);
+        if (afterUrl) return afterUrl;
+      }
+    }
+  }
+
+  for (const item of parsedData) {
+    if (Array.isArray(item)) {
+      for (const sub of item) {
+        const url = buildGradioMediaUrl(spaceBaseUrl, sub);
+        if (url) return url;
+      }
+    } else {
+      const url = buildGradioMediaUrl(spaceBaseUrl, item);
+      if (url) return url;
+    }
+  }
+  return '';
+}
+
+function resolveAnyHfToken(): string {
+  if (process.env.HF_TOKEN?.trim()) return process.env.HF_TOKEN.trim();
+  const store = getStore();
+  for (const p of store.providers) {
+    if (resolveGatewayVendorGroup(p) === 'huggingface') {
+      const key = unsealSecret(p.apiKeySealed) ?? '';
+      if (key) return key;
+    }
+  }
+  return '';
+}
+
+async function uploadToGradioSpace(
+  spaceBaseUrl: string,
+  imgRaw: string,
+  signal: AbortSignal,
+  hfToken?: string
+): Promise<GradioFileData> {
+  const resolved = await resolveImageBytes(imgRaw);
+  if (!resolved) {
+    throw Object.assign(new Error('Could not decode or fetch input image for AI Space.'), {
+      statusCode: 400,
+    });
+  }
+  const cleanBase = spaceBaseUrl.replace(/\/+$/, '');
+  const ext = resolved.mimeType.includes('png') ? 'png' : 'jpg';
+  const fd = new FormData();
+  fd.append(
+    'files',
+    new Blob([new Uint8Array(resolved.buffer)], { type: resolved.mimeType || 'image/jpeg' }),
+    `product.${ext}`
+  );
+  const upRes = await fetch(`${cleanBase}/gradio_api/upload`, {
+    method: 'POST',
+    headers: hfToken ? { Authorization: `Bearer ${hfToken}` } : undefined,
+    body: fd,
+    signal,
+  });
+  if (!upRes.ok) {
+    throw Object.assign(new Error(`Gradio upload HTTP ${upRes.status}`), {
+      statusCode: upRes.status,
+    });
+  }
+  const paths = (await upRes.json()) as unknown;
+  const uploadedPath = Array.isArray(paths) && typeof paths[0] === 'string' ? paths[0] : '';
+  if (!uploadedPath) {
+    throw Object.assign(new Error('Gradio upload returned empty path.'), { statusCode: 502 });
+  }
+  return {
+    path: uploadedPath,
+    url: `${cleanBase}/gradio_api/file=${uploadedPath}`,
+    orig_name: `product.${ext}`,
+    mime_type: resolved.mimeType || 'image/jpeg',
+    is_stream: false,
+    meta: { _type: 'gradio.FileData' },
+  };
+}
+
+async function invokeGradioSpace(params: {
+  spaceBaseUrl: string;
+  endpoint: string;
+  modelName: string;
+  timeoutMs: number;
+  probeOnly?: boolean;
+  inputImageRaw?: string;
+  buildData: (fileRef: GradioFileData | null) => unknown[];
+  preferCutoutOutput?: boolean;
+  expectedKind: 'image' | 'video';
+  specialty?: string;
+}): Promise<{ statusCode: number; data: unknown }> {
+  const cleanBase = params.spaceBaseUrl.replace(/\/+$/, '');
+  await assertSafeUpstreamUrl(cleanBase);
+
+  const hfToken = resolveAnyHfToken();
+  const authHeaders: Record<string, string> = hfToken
+    ? { Authorization: `Bearer ${hfToken}` }
+    : {};
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(params.timeoutMs, 35000));
+
+  try {
+    if (params.probeOnly) {
+      const cfgRes = await fetch(`${cleanBase}/config`, {
+        headers: authHeaders,
+        signal: controller.signal,
+      });
+      if (!cfgRes.ok) {
+        throw Object.assign(new Error(`Gradio Space HTTP ${cfgRes.status}`), {
+          statusCode: cfgRes.status,
+        });
+      }
+      return {
+        statusCode: 200,
+        data: {
+          model: params.modelName,
+          spaceUrl: cleanBase,
+          status: 'live',
+        },
+      };
+    }
+
+    let fileRef: GradioFileData | null = null;
+    if (params.inputImageRaw) {
+      fileRef = await uploadToGradioSpace(
+        cleanBase,
+        params.inputImageRaw,
+        controller.signal,
+        hfToken
+      );
+    }
+
+    const callRes = await fetch(`${cleanBase}/gradio_api/call/${params.endpoint}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders,
+      },
+      body: JSON.stringify({ data: params.buildData(fileRef) }),
+      signal: controller.signal,
+    });
+    if (!callRes.ok) {
+      const txt = await callRes.text();
+      throw Object.assign(
+        new Error(`Gradio call HTTP ${callRes.status}: ${txt.slice(0, 120)}`),
+        { statusCode: callRes.status }
+      );
+    }
+    const callJson = (await callRes.json()) as { event_id?: string };
+    const eventId = callJson?.event_id;
+    if (!eventId) {
+      throw Object.assign(new Error('Gradio call did not return event_id.'), {
+        statusCode: 502,
+      });
+    }
+
+    const sseRes = await fetch(`${cleanBase}/gradio_api/call/${params.endpoint}/${eventId}`, {
+      headers: authHeaders,
+      signal: controller.signal,
+    });
+    if (!sseRes.ok) {
+      throw Object.assign(new Error(`Gradio SSE HTTP ${sseRes.status}`), {
+        statusCode: sseRes.status,
+      });
+    }
+    const sseText = await sseRes.text();
+
+    let completeJsonRaw = '';
+    let hasErrorEvent = false;
+    let errorDetail = '';
+    const lines = sseText.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line === 'event: complete') {
+        const nextLine = lines[i + 1]?.trim() || '';
+        if (nextLine.startsWith('data:')) {
+          completeJsonRaw = nextLine.slice(5).trim();
+        }
+      } else if (line === 'event: error') {
+        hasErrorEvent = true;
+        const nextLine = lines[i + 1]?.trim() || '';
+        if (nextLine.startsWith('data:')) {
+          errorDetail = nextLine.slice(5).trim();
+        }
+      }
+    }
+
+    if (hasErrorEvent && !completeJsonRaw) {
+      throw Object.assign(
+        new Error(
+          `Gradio Space returned queue/quota error${errorDetail && errorDetail !== 'null' ? `: ${errorDetail.slice(0, 120)}` : ''}`
+        ),
+        { statusCode: 503 }
+      );
+    }
+    if (!completeJsonRaw) {
+      throw Object.assign(new Error('Gradio Space stream finished without complete payload.'), {
+        statusCode: 502,
+      });
+    }
+
+    const parsedData = JSON.parse(completeJsonRaw) as unknown[];
+    const mediaUrl = extractGradioOutputMediaUrl(
+      cleanBase,
+      parsedData,
+      Boolean(params.preferCutoutOutput)
+    );
+    if (!mediaUrl) {
+      throw Object.assign(new Error('Gradio Space returned no output file URL.'), {
+        statusCode: 502,
+      });
+    }
+
+    const safeMediaUrl = await assertSafeUpstreamUrl(mediaUrl);
+    const mediaRes = await fetch(safeMediaUrl.toString(), {
+      headers: mediaUrl.startsWith(cleanBase) ? authHeaders : undefined,
+      signal: controller.signal,
+    });
+    if (!mediaRes.ok) {
+      throw Object.assign(new Error(`Gradio file download HTTP ${mediaRes.status}`), {
+        statusCode: mediaRes.status,
+      });
+    }
+    const defaultMime = params.expectedKind === 'video' ? 'video/mp4' : 'image/png';
+    const rawMime = mediaRes.headers.get('content-type')?.split(';')[0]?.trim() || defaultMime;
+    const mime =
+      rawMime.startsWith('image/') || rawMime.startsWith('video/') ? rawMime : defaultMime;
+    const buf = Buffer.from(await mediaRes.arrayBuffer());
+    const b64 = buf.toString('base64');
+
+    return {
+      statusCode: 200,
+      data: {
+        created: Math.floor(Date.now() / 1000),
+        model: params.modelName,
+        ...(params.specialty ? { specialty: params.specialty } : {}),
+        data: [{ b64_json: b64, url: `data:${mime};base64,${b64}` }],
+      },
+    };
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw Object.assign(new Error(`Gradio Space timeout after ${params.timeoutMs}ms`), {
+        statusCode: 504,
+      });
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function invokeSingleProvider(
   provider: StoredUpstreamProvider,
   payload: Record<string, unknown>
@@ -246,15 +615,103 @@ async function invokeSingleProvider(
   }
 
   if (provider.category === 'image') {
-    const cleanPrompt = promptText.slice(0, 500);
+    const cleanPrompt = promptText.slice(0, 700);
     const width = Number(payload.width) || 1024;
     const height = Number(payload.height) || 1024;
-    const inputImageUrl =
+    const inputImageRaw =
       typeof payload.image_url === 'string'
         ? payload.image_url.trim()
         : typeof payload.image === 'string'
           ? payload.image.trim()
           : '';
+
+    if (provider.baseUrl.includes('briaai-bria-rmbg-1-4.hf.space')) {
+      return await invokeGradioSpace({
+        spaceBaseUrl: provider.baseUrl,
+        endpoint: 'run',
+        modelName: provider.model,
+        timeoutMs: provider.timeoutMs,
+        probeOnly: payload.__probeOnly === true,
+        inputImageRaw,
+        buildData: (fileRef) => [fileRef],
+        preferCutoutOutput: true,
+        expectedKind: 'image',
+        specialty: 'bg_removal',
+      });
+    }
+
+    if (provider.baseUrl.includes('not-lain-background-removal.hf.space')) {
+      return await invokeGradioSpace({
+        spaceBaseUrl: provider.baseUrl,
+        endpoint: 'image',
+        modelName: provider.model,
+        timeoutMs: provider.timeoutMs,
+        probeOnly: payload.__probeOnly === true,
+        inputImageRaw,
+        buildData: (fileRef) => [fileRef],
+        preferCutoutOutput: true,
+        expectedKind: 'image',
+        specialty: 'bg_removal',
+      });
+    }
+
+    if (provider.baseUrl.includes('zhengpeng7-birefnet-demo.hf.space')) {
+      return await invokeGradioSpace({
+        spaceBaseUrl: provider.baseUrl,
+        endpoint: 'image',
+        modelName: provider.model,
+        timeoutMs: provider.timeoutMs,
+        probeOnly: payload.__probeOnly === true,
+        inputImageRaw,
+        buildData: (fileRef) => [fileRef, '1024x1024', 'General'],
+        preferCutoutOutput: true,
+        expectedKind: 'image',
+        specialty: 'bg_removal',
+      });
+    }
+
+    if (provider.baseUrl.includes('black-forest-labs-flux-1-kontext-dev.hf.space')) {
+      return await invokeGradioSpace({
+        spaceBaseUrl: provider.baseUrl,
+        endpoint: 'infer',
+        modelName: provider.model,
+        timeoutMs: provider.timeoutMs,
+        probeOnly: payload.__probeOnly === true,
+        inputImageRaw,
+        buildData: (fileRef) => [fileRef, cleanPrompt, 0, true, 2.5, 20],
+        expectedKind: 'image',
+        specialty: 'bg_edit',
+      });
+    }
+
+    if (provider.baseUrl.includes('qwen-qwen-image-edit.hf.space')) {
+      return await invokeGradioSpace({
+        spaceBaseUrl: provider.baseUrl,
+        endpoint: 'infer',
+        modelName: provider.model,
+        timeoutMs: provider.timeoutMs,
+        probeOnly: payload.__probeOnly === true,
+        inputImageRaw,
+        buildData: (fileRef) => [fileRef, cleanPrompt, 0, true, 4, 24, true],
+        expectedKind: 'image',
+        specialty: 'bg_edit',
+      });
+    }
+
+    if (provider.baseUrl.includes('black-forest-labs-flux-1-schnell.hf.space')) {
+      const clampedW = Math.max(512, Math.min(1024, Math.round(width / 16) * 16));
+      const clampedH = Math.max(512, Math.min(1024, Math.round(height / 16) * 16));
+      return await invokeGradioSpace({
+        spaceBaseUrl: provider.baseUrl,
+        endpoint: 'infer',
+        modelName: provider.model,
+        timeoutMs: provider.timeoutMs,
+        probeOnly: payload.__probeOnly === true,
+        buildData: () => [cleanPrompt, 0, true, clampedW, clampedH, 4],
+        expectedKind: 'image',
+        specialty: 'generate',
+      });
+    }
 
     if (provider.baseUrl.includes('lllyasviel-ic-light.hf.space')) {
       const spaceRes = await fetch('https://lllyasviel-ic-light.hf.space/config');
@@ -263,18 +720,366 @@ async function invokeSingleProvider(
           statusCode: spaceRes.status,
         });
       }
-      return {
-        statusCode: 200,
-        data: {
-          model: 'lllyasviel/IC-Light',
-          spaceUrl: 'https://lllyasviel-ic-light.hf.space',
-          gradioApi: 'https://lllyasviel-ic-light.hf.space/gradio_api/call/process_relight',
-          status: 'running',
-          note: inputImageUrl
-            ? 'IC-Light Space is live. Submit foreground image + lighting prompt to gradioApi.'
-            : 'IC-Light Space verified live (Gradio). Pass image_url for product relighting workflows.',
-        },
-      };
+      if (payload.__probeOnly === true || !inputImageRaw) {
+        return {
+          statusCode: 200,
+          data: {
+            model: 'lllyasviel/IC-Light',
+            spaceUrl: 'https://lllyasviel-ic-light.hf.space',
+            gradioApi: 'https://lllyasviel-ic-light.hf.space/gradio_api/call/process_relight',
+            status: 'running',
+            note: 'IC-Light Space verified live (Gradio).',
+          },
+        };
+      }
+      throw Object.assign(
+        new Error('IC-Light Gradio queue requires interactive upload; failing over to direct image-edit API.'),
+        { statusCode: 503 }
+      );
+    }
+
+    if (provider.baseUrl.includes('api.airforce')) {
+      const apiKey = resolveProviderApiKey(provider);
+      if (!apiKey) {
+        throw Object.assign(new Error('Api.Airforce key is missing.'), { statusCode: 401 });
+      }
+      if (payload.__probeOnly === true) {
+        const mRes = await fetch('https://api.airforce/v1/models');
+        if (!mRes.ok) {
+          throw Object.assign(new Error(`Api.Airforce HTTP ${mRes.status}`), {
+            statusCode: mRes.status,
+          });
+        }
+        return {
+          statusCode: 200,
+          data: { model: provider.model, status: 'verified' },
+        };
+      }
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.max(provider.timeoutMs, 28000));
+      try {
+        const reqBody: Record<string, unknown> = {
+          model: provider.model || (inputImageRaw ? 'flux.1-kontext-pro' : 'flux-1.1-pro'),
+          prompt: cleanPrompt,
+          size: `${Math.min(1024, Math.max(512, width))}x${Math.min(1024, Math.max(512, height))}`,
+          n: 1,
+        };
+        if (inputImageRaw) {
+          reqBody.image = inputImageRaw;
+          reqBody.image_url = inputImageRaw;
+        }
+        const afRes = await fetch('https://api.airforce/v1/images/generations', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
+        if (!afRes.ok) {
+          const errTxt = await afRes.text();
+          throw Object.assign(
+            new Error(`Api.Airforce HTTP ${afRes.status}: ${errTxt.slice(0, 140)}`),
+            { statusCode: afRes.status }
+          );
+        }
+        const ct = afRes.headers.get('content-type') || '';
+        if (ct.startsWith('image/')) {
+          const buf = Buffer.from(await afRes.arrayBuffer());
+          const b64 = buf.toString('base64');
+          const mime = ct.split(';')[0] || 'image/png';
+          return {
+            statusCode: 200,
+            data: {
+              model: reqBody.model,
+              specialty: provider.specialty || 'generate',
+              data: [{ b64_json: b64, url: `data:${mime};base64,${b64}` }],
+            },
+          };
+        }
+        const json = (await afRes.json()) as {
+          data?: Array<{ url?: string; b64_json?: string }>;
+        };
+        const first = json.data?.[0];
+        if (first?.b64_json) {
+          return {
+            statusCode: 200,
+            data: {
+              model: reqBody.model,
+              specialty: provider.specialty || 'generate',
+              data: [
+                {
+                  b64_json: first.b64_json,
+                  url: first.url || `data:image/png;base64,${first.b64_json}`,
+                },
+              ],
+            },
+          };
+        }
+        if (first?.url) {
+          const resolved = await resolveImageBytes(first.url);
+          if (resolved) {
+            return {
+              statusCode: 200,
+              data: {
+                model: reqBody.model,
+                specialty: provider.specialty || 'generate',
+                data: [
+                  {
+                    b64_json: resolved.base64,
+                    url: `data:${resolved.mimeType};base64,${resolved.base64}`,
+                  },
+                ],
+              },
+            };
+          }
+          return { statusCode: 200, data: json };
+        }
+        throw Object.assign(new Error('Api.Airforce returned no image output.'), {
+          statusCode: 502,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    if (provider.baseUrl.includes('aihorde.net')) {
+      const apiKey = resolveProviderApiKey(provider) || '0000000000';
+      if (payload.__probeOnly === true) {
+        const mRes = await fetch('https://aihorde.net/api/v2/status/models?type=image', {
+          headers: { 'Client-Agent': 'AlShamsawyaStudio:1.0:studio' },
+        });
+        if (!mRes.ok) {
+          throw Object.assign(new Error(`AI Horde HTTP ${mRes.status}`), {
+            statusCode: mRes.status,
+          });
+        }
+        return {
+          statusCode: 200,
+          data: { model: provider.model, status: 'live' },
+        };
+      }
+
+      const controller = new AbortController();
+      const totalTimeout = Math.max(provider.timeoutMs, 42000);
+      const timer = setTimeout(() => controller.abort(), totalTimeout);
+      try {
+        let pickedModels = ['Deliberate 3.0', 'Realistic Vision', 'Dreamshaper', 'AbsoluteReality'];
+        try {
+          const mRes = await fetch('https://aihorde.net/api/v2/status/models?type=image', {
+            headers: { 'Client-Agent': 'AlShamsawyaStudio:1.0:studio' },
+            signal: AbortSignal.timeout(2500),
+          });
+          if (mRes.ok) {
+            const list = (await mRes.json()) as Array<{
+              name: string;
+              count: number;
+              eta: number;
+            }>;
+            const fastRealistic = list
+              .filter(
+                (m) =>
+                  m.count >= 1 &&
+                  m.eta <= 45 &&
+                  !/anime|pony|furry|yiff|hentai|nsfw|pixel|inpainting/i.test(m.name)
+              )
+              .sort((a, b) => a.eta - b.eta || b.count - a.count)
+              .slice(0, 4)
+              .map((m) => m.name);
+            if (fastRealistic.length > 0) {
+              pickedModels = fastRealistic;
+            }
+          }
+        } catch {
+          // Use defaults
+        }
+
+        const isAnon = apiKey === '0000000000';
+        const maxDim = isAnon ? 576 : 1024;
+        const hordeW = Math.max(384, Math.min(maxDim, Math.round(width / 64) * 64));
+        const hordeH = Math.max(384, Math.min(maxDim, Math.round(height / 64) * 64));
+
+        const subRes = await fetch('https://aihorde.net/api/v2/generate/async', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: apiKey,
+            'Client-Agent': 'AlShamsawyaStudio:1.0:studio',
+          },
+          body: JSON.stringify({
+            prompt: `${cleanPrompt}, realistic interior photography, soft natural studio lighting ### ugly, blurry, watermark, text, distorted`,
+            models: pickedModels,
+            params: {
+              width: hordeW,
+              height: hordeH,
+              steps: 14,
+              n: 1,
+              sampler_name: 'k_euler_a',
+              cfg_scale: 7,
+            },
+            r2: true,
+            nsfw: false,
+          }),
+          signal: controller.signal,
+        });
+        if (!subRes.ok) {
+          const errTxt = await subRes.text();
+          throw Object.assign(
+            new Error(`AI Horde submit HTTP ${subRes.status}: ${errTxt.slice(0, 120)}`),
+            { statusCode: subRes.status }
+          );
+        }
+        const subJson = (await subRes.json()) as { id?: string };
+        const jobId = subJson.id;
+        if (!jobId) {
+          throw Object.assign(new Error('AI Horde did not return job ID.'), { statusCode: 502 });
+        }
+
+        const deadline = Date.now() + totalTimeout - 3000;
+        let done = false;
+        while (Date.now() < deadline && !controller.signal.aborted) {
+          await new Promise((r) => setTimeout(r, 1800));
+          const chkRes = await fetch(`https://aihorde.net/api/v2/generate/check/${jobId}`, {
+            headers: { 'Client-Agent': 'AlShamsawyaStudio:1.0:studio' },
+            signal: controller.signal,
+          });
+          if (!chkRes.ok) continue;
+          const chkJson = (await chkRes.json()) as {
+            done?: boolean;
+            faulted?: boolean;
+            wait_time?: number;
+          };
+          if (chkJson.faulted) {
+            throw Object.assign(new Error('AI Horde generation faulted.'), { statusCode: 502 });
+          }
+          if (chkJson.done) {
+            done = true;
+            break;
+          }
+          if (
+            typeof chkJson.wait_time === 'number' &&
+            chkJson.wait_time > 180 &&
+            Date.now() + 25000 > deadline
+          ) {
+            break;
+          }
+        }
+
+        if (!done) {
+          throw Object.assign(
+            new Error('AI Horde queue wait exceeded timeout; failing over to next provider.'),
+            { statusCode: 504 }
+          );
+        }
+
+        const stRes = await fetch(`https://aihorde.net/api/v2/generate/status/${jobId}`, {
+          headers: { 'Client-Agent': 'AlShamsawyaStudio:1.0:studio' },
+          signal: controller.signal,
+        });
+        if (!stRes.ok) {
+          throw Object.assign(new Error(`AI Horde status HTTP ${stRes.status}`), {
+            statusCode: stRes.status,
+          });
+        }
+        const stJson = (await stRes.json()) as {
+          generations?: Array<{ img?: string; model?: string }>;
+        };
+        const firstGen = stJson.generations?.[0];
+        if (!firstGen?.img) {
+          throw Object.assign(new Error('AI Horde returned empty image payload.'), {
+            statusCode: 502,
+          });
+        }
+
+        if (firstGen.img.startsWith('http')) {
+          const safeUrl = await assertSafeUpstreamUrl(firstGen.img);
+          const dlRes = await fetch(safeUrl.toString(), { signal: controller.signal });
+          if (!dlRes.ok) {
+            throw Object.assign(new Error(`AI Horde image download HTTP ${dlRes.status}`), {
+              statusCode: dlRes.status,
+            });
+          }
+          const mime = dlRes.headers.get('content-type')?.split(';')[0] || 'image/webp';
+          const b64 = Buffer.from(await dlRes.arrayBuffer()).toString('base64');
+          return {
+            statusCode: 200,
+            data: {
+              model: firstGen.model || pickedModels[0],
+              specialty: 'generate',
+              data: [{ b64_json: b64, url: `data:${mime};base64,${b64}` }],
+            },
+          };
+        }
+
+        const cleanB64 = firstGen.img.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
+        return {
+          statusCode: 200,
+          data: {
+            model: firstGen.model || pickedModels[0],
+            specialty: 'generate',
+            data: [{ b64_json: cleanB64, url: `data:image/webp;base64,${cleanB64}` }],
+          },
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    if (provider.baseUrl.includes('ai.api.nvidia.com')) {
+      const apiKey = resolveProviderApiKey(provider);
+      if (!apiKey) {
+        throw Object.assign(new Error('NVIDIA NIM API key is missing.'), { statusCode: 401 });
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.max(provider.timeoutMs, 25000));
+      try {
+        const nvRes = await fetch(provider.baseUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            text_prompts: [{ text: cleanPrompt, weight: 1 }],
+            cfg_scale: 5,
+            sampler: 'K_EULER_ANCESTRAL',
+            seed: 0,
+            steps: 20,
+            width: Math.min(1024, Math.max(512, Math.round(width / 64) * 64)),
+            height: Math.min(1024, Math.max(512, Math.round(height / 64) * 64)),
+          }),
+          signal: controller.signal,
+        });
+        const nvJson = (await nvRes.json().catch(() => ({}))) as {
+          artifacts?: Array<{ base64?: string }>;
+          detail?: string;
+        };
+        if (!nvRes.ok) {
+          throw Object.assign(
+            new Error(`NVIDIA SDXL HTTP ${nvRes.status}: ${nvJson.detail || 'Error'}`),
+            { statusCode: nvRes.status }
+          );
+        }
+        const b64 = nvJson.artifacts?.[0]?.base64;
+        if (!b64) {
+          throw Object.assign(new Error('NVIDIA NIM SDXL returned no image artifact.'), {
+            statusCode: 502,
+          });
+        }
+        return {
+          statusCode: 200,
+          data: {
+            model: provider.model,
+            specialty: 'generate',
+            data: [{ b64_json: b64, url: `data:image/jpeg;base64,${b64}` }],
+          },
+        };
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     if (provider.baseUrl.includes('pollinations.ai')) {
@@ -282,9 +1087,9 @@ async function invokeSingleProvider(
       const isGenApi = provider.baseUrl.includes('gen.pollinations.ai');
       let targetUrl = isGenApi
         ? `https://gen.pollinations.ai/image/${encodeURIComponent(cleanPrompt)}?model=${encodeURIComponent(provider.model || 'black-forest-labs/flux.2-klein-4b')}&width=${width}&height=${height}`
-        : `https://image.pollinations.ai/prompt/${encodeURIComponent(cleanPrompt)}?model=${encodeURIComponent(provider.model || 'flux')}&width=${width}&height=${height}&nologo=true`;
-      if (inputImageUrl && inputImageUrl.startsWith('https://')) {
-        targetUrl += `&image=${encodeURIComponent(inputImageUrl)}`;
+        : `https://image.pollinations.ai/prompt/${encodeURIComponent(cleanPrompt)}?model=${encodeURIComponent(provider.model || 'turbo')}&width=${width}&height=${height}&nologo=true`;
+      if (inputImageRaw && inputImageRaw.startsWith('https://')) {
+        targetUrl += `&image=${encodeURIComponent(inputImageRaw)}`;
       }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), provider.timeoutMs);
@@ -298,6 +1103,21 @@ async function invokeSingleProvider(
           throw Object.assign(new Error(`Pollinations HTTP ${res.status}`), {
             statusCode: res.status,
           });
+        }
+        const contentType = res.headers.get('content-type') || '';
+        if (payload.__probeOnly !== true && contentType.startsWith('image/')) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          const b64 = buf.toString('base64');
+          const mime = contentType.split(';')[0] || 'image/jpeg';
+          return {
+            statusCode: 200,
+            data: {
+              created: Math.floor(Date.now() / 1000),
+              model: provider.model || 'flux',
+              specialty: provider.specialty || 'generate',
+              data: [{ b64_json: b64, url: `data:${mime};base64,${b64}` }],
+            },
+          };
         }
         return {
           statusCode: 200,
@@ -340,68 +1160,193 @@ async function invokeSingleProvider(
         throw Object.assign(new Error('Gemini upstream key is missing.'), { statusCode: 401 });
       }
       const ai = createGeminiClient(apiKey);
-      const imageModel = provider.model || 'gemini-3.1-flash-lite-image';
+      const primaryModel = provider.model || 'gemini-3.1-flash-lite-image';
 
       if (payload.__probeOnly === true) {
-        const meta = await ai.models.get({ model: imageModel });
+        const meta = await ai.models.get({ model: primaryModel });
         return {
           statusCode: 200,
           data: {
-            model: meta.name || imageModel,
+            model: meta.name || primaryModel,
             status: 'verified',
           },
         };
       }
 
       const parts: Array<{ text?: string; inlineData?: { data: string; mimeType: string } }> = [];
-      if (inputImageUrl && inputImageUrl.startsWith('https://')) {
-        const safeImg = await assertSafeUpstreamUrl(inputImageUrl);
-        const imgRes = await fetch(safeImg.toString());
-        if (imgRes.ok) {
-          const buf = Buffer.from(await imgRes.arrayBuffer());
-          parts.push({
-            inlineData: {
-              data: buf.toString('base64'),
-              mimeType: imgRes.headers.get('content-type') || 'image/png',
-            },
-          });
-        }
+      const resolvedImg = await resolveImageBytes(inputImageRaw);
+      if (resolvedImg) {
+        parts.push({
+          inlineData: {
+            data: resolvedImg.base64,
+            mimeType: resolvedImg.mimeType,
+          },
+        });
       }
       parts.push({ text: cleanPrompt });
 
-      const response = await ai.models.generateContent({
-        model: imageModel,
-        contents: { parts },
-      });
-
-      const outImages: Array<{ b64_json: string; url: string }> = [];
-      for (const part of response.candidates?.[0]?.content?.parts ?? []) {
-        if (part.inlineData?.data) {
-          const mime = part.inlineData.mimeType || 'image/png';
-          outImages.push({
-            b64_json: part.inlineData.data,
-            url: `data:${mime};base64,${part.inlineData.data}`,
+      const modelsToTry = Array.from(
+        new Set([primaryModel, 'gemini-3.1-flash-lite-image', 'gemini-nano-banana-2.1'])
+      );
+      let lastErr: unknown = null;
+      for (const candidateModel of modelsToTry) {
+        try {
+          const response = await ai.models.generateContent({
+            model: candidateModel,
+            contents: { parts },
           });
+          const outImages: Array<{ b64_json: string; url: string }> = [];
+          for (const part of response.candidates?.[0]?.content?.parts ?? []) {
+            if (part.inlineData?.data) {
+              const mime = part.inlineData.mimeType || 'image/png';
+              outImages.push({
+                b64_json: part.inlineData.data,
+                url: `data:${mime};base64,${part.inlineData.data}`,
+              });
+            }
+          }
+          if (outImages.length > 0) {
+            return {
+              statusCode: 200,
+              data: {
+                model: candidateModel,
+                data: outImages,
+              },
+            };
+          }
+        } catch (err) {
+          lastErr = err;
         }
       }
-      if (outImages.length === 0) {
-        throw Object.assign(
-          new Error('Gemini did not return an image part for this prompt/key.'),
-          { statusCode: 502 }
-        );
-      }
-      return {
-        statusCode: 200,
-        data: {
-          model: imageModel,
-          data: outImages,
-        },
-      };
+      throw lastErr instanceof Error
+        ? lastErr
+        : Object.assign(
+            new Error('Gemini did not return an image part for this prompt/key.'),
+            { statusCode: 502 }
+          );
     }
   }
 
   if (provider.category === 'video') {
-    const cleanPrompt = promptText.slice(0, 400);
+    const cleanPrompt = promptText.slice(0, 500);
+    const startFrameRaw =
+      typeof payload.start_image === 'string'
+        ? payload.start_image
+        : typeof payload.image_url === 'string'
+          ? payload.image_url
+          : typeof payload.image === 'string'
+            ? payload.image
+            : '';
+    const endFrameRaw =
+      typeof payload.end_image === 'string' ? payload.end_image : '';
+    const aspectRatioRaw =
+      payload.aspect_ratio === '9:16' ? '9:16' : '16:9';
+    const rawDurSec = Number.parseInt(String(payload.duration || '5'), 10);
+    const clampedDurSec = Number.isFinite(rawDurSec)
+      ? Math.max(3, Math.min(endFrameRaw ? 10 : 15, rawDurSec))
+      : 5;
+
+    if (provider.baseUrl.includes('lightricks-ltx-video-distilled.hf.space')) {
+      const ltxH = aspectRatioRaw === '9:16' ? 704 : 512;
+      const ltxW = aspectRatioRaw === '9:16' ? 512 : 704;
+      const ltxDur = Math.max(2, Math.min(5, clampedDurSec));
+      const useI2V = Boolean(startFrameRaw);
+      return await invokeGradioSpace({
+        spaceBaseUrl: provider.baseUrl,
+        endpoint: useI2V ? 'image_to_video' : 'text_to_video',
+        modelName: provider.model,
+        timeoutMs: Math.max(provider.timeoutMs, 60000),
+        probeOnly: payload.__probeOnly === true,
+        inputImageRaw: useI2V ? startFrameRaw : undefined,
+        buildData: (fileRef) => [
+          cleanPrompt,
+          'worst quality, inconsistent motion, blurry, jittery, distorted',
+          useI2V ? fileRef : '',
+          '',
+          ltxH,
+          ltxW,
+          useI2V ? 'image-to-video' : 'text-to-video',
+          ltxDur,
+          9,
+          42,
+          true,
+          1,
+          true,
+        ],
+        expectedKind: 'video',
+      });
+    }
+
+    if (provider.baseUrl.includes('api.airforce')) {
+      const apiKey = resolveProviderApiKey(provider);
+      if (!apiKey) {
+        throw Object.assign(new Error('Api.Airforce key is missing.'), { statusCode: 401 });
+      }
+      if (payload.__probeOnly === true) {
+        const mRes = await fetch('https://api.airforce/v1/models');
+        if (!mRes.ok) {
+          throw Object.assign(new Error(`Api.Airforce HTTP ${mRes.status}`), {
+            statusCode: mRes.status,
+          });
+        }
+        return { statusCode: 200, data: { model: provider.model, status: 'verified' } };
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.max(provider.timeoutMs, 45000));
+      try {
+        const videoBody: Record<string, unknown> = {
+          model: provider.model || (startFrameRaw ? 'wan2.6-i2v' : 'wan2.5-t2v'),
+          prompt: cleanPrompt,
+          aspect_ratio: aspectRatioRaw,
+          duration: clampedDurSec,
+        };
+        if (startFrameRaw) {
+          videoBody.image = startFrameRaw;
+          videoBody.image_url = startFrameRaw;
+        }
+        const afRes = await fetch('https://api.airforce/v1/images/generations', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(videoBody),
+          signal: controller.signal,
+        });
+        if (!afRes.ok) {
+          const errTxt = await afRes.text();
+          throw Object.assign(
+            new Error(`Api.Airforce Video HTTP ${afRes.status}: ${errTxt.slice(0, 140)}`),
+            { statusCode: afRes.status }
+          );
+        }
+        const ct = afRes.headers.get('content-type') || '';
+        if (ct.startsWith('video/')) {
+          const b64 = Buffer.from(await afRes.arrayBuffer()).toString('base64');
+          const mime = ct.split(';')[0] || 'video/mp4';
+          return {
+            statusCode: 200,
+            data: {
+              model: videoBody.model,
+              data: [{ b64_json: b64, url: `data:${mime};base64,${b64}` }],
+            },
+          };
+        }
+        const vJson = (await afRes.json()) as {
+          data?: Array<{ url?: string; b64_json?: string }>;
+        };
+        const first = vJson.data?.[0];
+        if (first?.url || first?.b64_json) {
+          return { statusCode: 200, data: vJson };
+        }
+        throw Object.assign(new Error('Api.Airforce video returned no output.'), {
+          statusCode: 502,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
     if (provider.baseUrl.includes('pixabay.com')) {
       const apiKey = resolveProviderApiKey(provider);
       if (!apiKey) {
@@ -444,9 +1389,12 @@ async function invokeSingleProvider(
 
     if (provider.baseUrl.includes('pollinations.ai')) {
       const apiKey = resolveProviderApiKey(provider);
-      const targetUrl = `https://gen.pollinations.ai/video/${encodeURIComponent(cleanPrompt)}?model=${encodeURIComponent(provider.model || 'alibaba/wan-2.2-fast')}`;
+      let targetUrl = `https://gen.pollinations.ai/video/${encodeURIComponent(cleanPrompt)}?model=${encodeURIComponent(provider.model || 'alibaba/wan-2.2-fast')}&aspectRatio=${encodeURIComponent(aspectRatioRaw)}&duration=${clampedDurSec}`;
+      if (startFrameRaw && startFrameRaw.startsWith('https://')) {
+        targetUrl += `&image=${encodeURIComponent(startFrameRaw)}`;
+      }
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), provider.timeoutMs);
+      const timer = setTimeout(() => controller.abort(), Math.max(provider.timeoutMs, 30000));
       try {
         const res = await fetch(targetUrl, {
           method: 'GET',
@@ -457,6 +1405,19 @@ async function invokeSingleProvider(
           throw Object.assign(new Error(`Pollinations Video HTTP ${res.status}`), {
             statusCode: res.status,
           });
+        }
+        const cType = res.headers.get('content-type') || '';
+        if (payload.__probeOnly !== true && cType.startsWith('video/')) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          const b64 = buf.toString('base64');
+          const mime = cType.split(';')[0] || 'video/mp4';
+          return {
+            statusCode: 200,
+            data: {
+              model: provider.model || 'alibaba/wan-2.2-fast',
+              data: [{ b64_json: b64, url: `data:${mime};base64,${b64}` }],
+            },
+          };
         }
         return {
           statusCode: 200,
@@ -489,17 +1450,52 @@ async function invokeSingleProvider(
         };
       }
 
+      const startImg = await resolveImageBytes(startFrameRaw);
+      const endImg = await resolveImageBytes(endFrameRaw);
+
+      type InteractionInputItem =
+        | { type: 'image'; mime_type: string; data: string }
+        | { type: 'text'; text: string };
+      let interactionInput: string | InteractionInputItem[] = cleanPrompt;
+
+      if (startImg || endImg) {
+        const items: InteractionInputItem[] = [];
+        if (startImg) {
+          items.push({
+            type: 'image',
+            mime_type: startImg.mimeType,
+            data: startImg.base64,
+          });
+        }
+        if (endImg) {
+          items.push({
+            type: 'image',
+            mime_type: endImg.mimeType,
+            data: endImg.base64,
+          });
+        }
+        const defaultGuidance =
+          startImg && endImg
+            ? 'Smoothly animate and transition from the first frame image to the last frame image, keeping exact handmade craft textures and lighting coherent.'
+            : 'Smoothly animate this handmade craft product with natural studio lighting and gentle camera motion while preserving exact textures.';
+        items.push({
+          type: 'text',
+          text: cleanPrompt && cleanPrompt !== '{}' ? cleanPrompt : defaultGuidance,
+        });
+        interactionInput = items;
+      }
+
       const interaction = await ai.interactions.create(
         {
           model: videoModel,
-          input: cleanPrompt,
+          input: interactionInput,
           background: false,
           store: false,
           stream: false,
           response_format: {
             type: 'video',
-            aspect_ratio: '16:9',
-            duration: '5s',
+            aspect_ratio: aspectRatioRaw,
+            duration: `${clampedDurSec}s`,
             resolution: '720p',
           },
         },
@@ -718,13 +1714,13 @@ async function invokeSingleProvider(
     if (provider.category === 'image' && provider.baseUrl.includes('huggingface.co')) {
       if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
       if (provider.specialty === 'bg_removal') {
-        const imgUrl =
+        const imgRaw =
           typeof payload.image_url === 'string'
             ? payload.image_url.trim()
             : typeof payload.image === 'string'
               ? payload.image.trim()
               : '';
-        if (!imgUrl) {
+        if (!imgRaw) {
           const whoami = await fetch('https://huggingface.co/api/whoami-v2', {
             headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
           });
@@ -739,25 +1735,23 @@ async function invokeSingleProvider(
               model: provider.model,
               specialty: 'bg_removal',
               status: 'ready',
-              note: 'HF token verified. Send image_url in JSON payload to remove background.',
+              note: 'HF token verified. Send image_url or data:image base64 in JSON payload to remove background.',
             },
           };
         }
-        const safeImg = await assertSafeUpstreamUrl(imgUrl);
-        const srcFetch = await fetch(safeImg.toString());
-        if (!srcFetch.ok) {
-          throw Object.assign(new Error(`Image fetch HTTP ${srcFetch.status}`), {
-            statusCode: srcFetch.status,
+        const resolvedImg = await resolveImageBytes(imgRaw);
+        if (!resolvedImg) {
+          throw Object.assign(new Error('Could not decode or fetch input image for RMBG.'), {
+            statusCode: 400,
           });
         }
-        const srcBytes = await srcFetch.arrayBuffer();
         const segRes = await fetch(targetUrl, {
           method: 'POST',
           headers: {
             ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-            'Content-Type': srcFetch.headers.get('content-type') || 'image/png',
+            'Content-Type': resolvedImg.mimeType || 'image/png',
           },
-          body: srcBytes,
+          body: new Uint8Array(resolvedImg.buffer),
           signal: controller.signal,
         });
         if (!segRes.ok) {
@@ -1024,7 +2018,7 @@ function selectOrderedCandidates(
     activeHealthy.push(p);
   }
 
-  // Fallback to all category providers if no specialty match was configured
+  // Fallback to compatible providers if no specialty match was configured
   if (activeHealthy.length === 0 && inCooldown.length === 0 && desiredSpecialty) {
     for (const p of store.providers) {
       if (
@@ -1032,6 +2026,14 @@ function selectOrderedCandidates(
         (!allowSandbox && p.adapter === 'sandbox-simulator') ||
         (p.category || 'llm') !== category ||
         !hasProviderCredentials(p)
+      ) {
+        continue;
+      }
+      // Never route background removal or image editing into pure text-to-image generators
+      if (
+        (desiredSpecialty === 'bg_removal' || desiredSpecialty === 'bg_edit') &&
+        p.specialty === 'generate' &&
+        p.adapter !== 'gemini'
       ) {
         continue;
       }
@@ -1076,6 +2078,7 @@ export async function executeUnifiedGateway(params: {
   payload: Record<string, unknown>;
   category?: ProviderCategory;
   allowSandbox?: boolean;
+  fullCascade?: boolean;
 }): Promise<{ httpStatus: number; body: GatewayExecutionResponse }> {
   const store = getStore();
   const requestId = `req_${crypto.randomBytes(8).toString('hex')}`;
@@ -1123,7 +2126,9 @@ export async function executeUnifiedGateway(params: {
     };
   }
 
-  const maxAttempts = Math.min(candidates.length, store.routing.maxRetries + 1);
+  const maxAttempts = params.fullCascade
+    ? candidates.length
+    : Math.min(candidates.length, store.routing.maxRetries + 1);
   let failedAttemptCount = 0;
 
   for (let i = 0; i < maxAttempts; i++) {

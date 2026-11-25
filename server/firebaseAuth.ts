@@ -8,7 +8,12 @@ interface FirebaseAppletConfig {
   projectId?: string;
 }
 
-const DEFAULT_SUPER_ADMIN_EMAIL = 'sambasuony@gmail.com';
+const DEFAULT_SUPER_ADMIN_EMAILS = [
+  'sambasuony@gmail.com',
+  'hmb.top.tube@gmail.com',
+  'tygosibs@gmail.com',
+  'shamscraftagency@gmail.com',
+];
 
 let cachedProjectId: string | null = null;
 let cachedApp: App | null = null;
@@ -45,11 +50,11 @@ function getFirebaseAdminAuthApp(): App | null {
 }
 
 function getAllowedAdminEmails(): string[] {
-  const configured = (process.env.TAYGOS_ADMIN_EMAIL || DEFAULT_SUPER_ADMIN_EMAIL)
+  const fromEnv = (process.env.TAYGOS_ADMIN_EMAIL || '')
     .split(',')
     .map((e) => e.trim().toLowerCase())
     .filter(Boolean);
-  return configured.length > 0 ? configured : [DEFAULT_SUPER_ADMIN_EMAIL];
+  return Array.from(new Set([...DEFAULT_SUPER_ADMIN_EMAILS, ...fromEnv]));
 }
 
 export function isFirebaseAuthConfigured(): boolean {
