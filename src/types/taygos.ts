@@ -138,6 +138,7 @@ export interface GatewayOverviewResponse {
   gatewayEndpointUrl: string;
   hasMasterEncryptionKey: boolean;
   hasGeminiEnvKey: boolean;
+  bootId?: string;
 }
 
 export interface AuthStatusResponse {

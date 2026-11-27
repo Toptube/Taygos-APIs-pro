@@ -129,6 +129,9 @@ export default function App() {
     }
   }, []);
 
+  const lastBootIdRef = useRef<string | null>(null);
+  const resyncInFlightRef = useRef(false);
+
   const fetchOverview = useCallback(
     async (tokenOverride?: string | null) => {
       const token = tokenOverride ?? (await getBearerToken());
@@ -147,6 +150,53 @@ export default function App() {
         if (res.ok) {
           const data = (await res.json()) as GatewayOverviewResponse;
           setOverview(data);
+
+          const bootChanged = Boolean(data.bootId && lastBootIdRef.current && lastBootIdRef.current !== data.bootId);
+          if (data.bootId) {
+            lastBootIdRef.current = data.bootId;
+          }
+          const needsRepair =
+            data.keys.length === 0 ||
+            data.keys.some((k) => !k.hmacReady) ||
+            data.providers.some(
+              (p) =>
+                p.requiresApiKey &&
+                !p.usesServerEnv &&
+                !p.keyConfigured &&
+                p.apiKeyMasked &&
+                p.apiKeyMasked !== 'not-set' &&
+                p.apiKeyMasked !== 'anonymous-free-tier'
+            ) ||
+            bootChanged;
+
+          if (auth.currentUser && needsRepair && !resyncInFlightRef.current) {
+            resyncInFlightRef.current = true;
+            try {
+              const snapshot = await loadCloudVaultSnapshot(auth.currentUser.uid);
+              if (
+                snapshot.accessKeys.length > 0 ||
+                snapshot.providers.length > 0 ||
+                snapshot.routing
+              ) {
+                await fetch('/api/admin/cloud/sync', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                  body: JSON.stringify(snapshot),
+                });
+                const refreshed = await fetch('/api/admin/overview', {
+                  headers: { Authorization: `Bearer ${token}` },
+                });
+                if (refreshed.ok) {
+                  setOverview((await refreshed.json()) as GatewayOverviewResponse);
+                }
+              }
+            } finally {
+              resyncInFlightRef.current = false;
+            }
+          }
         }
       } catch {
         // Ignore transient network errors

@@ -28,17 +28,23 @@ import {
 import {
   addUpstreamProviderRecord,
   claimInitialAdminPassword,
+  clearGatewayLogsRecord,
+  createAccessKeyRecord,
+  deleteKeyRecord,
+  deleteProviderRecord,
+  ensureDbHydrated,
   getStore,
   isAdminSetupRequired,
   isEnvPasscodeConfigured,
-  persistStore,
+  persistKeyRecord,
+  persistProviderRecord,
+  persistSettingsRecord,
   revealAccessKeySecret,
   rotateAccessKeySecret,
   syncCloudVaultToStore,
   toPublicKeyView,
   toPublicProviderView,
   verifyAdminPasscode,
-  createAccessKeyRecord,
   type StoredAccessKey,
 } from './server/store.ts';
 import type {
@@ -53,6 +59,7 @@ interface RawBodyRequest extends Request {
 }
 
 const PORT = 3000;
+const SERVER_BOOT_ID = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 
 function extractBearerToken(req: Request): string {
   const header = req.headers.authorization;
@@ -66,6 +73,7 @@ async function requireAdminAuth(
   res: Response,
   next: NextFunction
 ): Promise<void> {
+  await ensureDbHydrated();
   const token = extractBearerToken(req);
   if (verifyAdminSessionToken(token)) {
     next();
@@ -204,14 +212,17 @@ async function startServer(): Promise<void> {
     res.json({ ok: true, service: 'taygos-apis', timestamp: new Date().toISOString() });
   });
 
-  // Public API Gateway CORS (for external client apps consuming the unified endpoint)
+  // Public API Gateway CORS (for external client apps & SDKs consuming unified endpoints)
   app.use('/api/v1', (req, res, next) => {
+    const requestedHeaders =
+      typeof req.headers['access-control-request-headers'] === 'string' &&
+      req.headers['access-control-request-headers'].trim()
+        ? req.headers['access-control-request-headers']
+        : 'Content-Type, Authorization, X-API-Key, X-Taygos-API-Key, X-Taygos-Public-Key, X-Taygos-Secret-Key, X-Taygos-Timestamp, X-Taygos-Signature, anthropic-version';
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-Taygos-Public-Key, X-Taygos-Secret-Key, X-Taygos-Timestamp, X-Taygos-Signature'
-    );
+    res.setHeader('Access-Control-Allow-Headers', requestedHeaders);
+    res.setHeader('Access-Control-Max-Age', '86400');
     if (req.method === 'OPTIONS') {
       res.status(204).end();
       return;
@@ -219,10 +230,64 @@ async function startServer(): Promise<void> {
     next();
   });
 
+  function extractAssistantTextFromGatewayData(rawData: Record<string, unknown> | undefined): string {
+    if (typeof rawData?.output === 'string') {
+      return rawData.output;
+    }
+    if (
+      Array.isArray(rawData?.choices) &&
+      rawData.choices[0] &&
+      typeof (rawData.choices[0] as { message?: { content?: unknown } })?.message
+        ?.content === 'string'
+    ) {
+      return (rawData.choices[0] as { message: { content: string } }).message.content;
+    }
+    if (
+      Array.isArray(rawData?.content) &&
+      rawData.content[0] &&
+      typeof (rawData.content[0] as { text?: unknown })?.text === 'string'
+    ) {
+      return (rawData.content[0] as { text: string }).text;
+    }
+    return JSON.stringify(rawData ?? {});
+  }
+
+  // OpenAI-Compatible Models List Endpoint
+  app.get('/api/v1/models', async (req: RawBodyRequest, res: Response) => {
+    const auth = await authenticateGatewayRequest(req.headers, '');
+    if (!auth.ok || !auth.key) {
+      res.status(auth.statusCode).json({
+        error: { message: auth.error || 'Unauthorized', type: 'authentication_error' },
+      });
+      return;
+    }
+    const store = getStore();
+    const seen = new Set<string>(['taygos-unified']);
+    const data: Array<{ id: string; object: 'model'; created: number; owned_by: string }> = [
+      {
+        id: 'taygos-unified',
+        object: 'model',
+        created: 1700000000,
+        owned_by: 'taygos',
+      },
+    ];
+    for (const p of store.providers) {
+      if (!p.enabled || !p.model || seen.has(p.model)) continue;
+      seen.add(p.model);
+      data.push({
+        id: p.model,
+        object: 'model',
+        created: 1700000000,
+        owned_by: p.name,
+      });
+    }
+    res.json({ object: 'list', data });
+  });
+
   // Public Unified Gateway Endpoints
   const handleGatewayDispatch = async (req: RawBodyRequest, res: Response) => {
     const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
-    const auth = authenticateGatewayRequest(req.headers, rawBody);
+    const auth = await authenticateGatewayRequest(req.headers, rawBody);
     if (!auth.ok || !auth.key || !auth.authMethod) {
       res.status(auth.statusCode).json({ ok: false, error: auth.error });
       return;
@@ -256,7 +321,7 @@ async function startServer(): Promise<void> {
   // OpenAI-Compatible Chat Completions Endpoint (for AI Chat Apps & SDKs)
   app.post('/api/v1/chat/completions', async (req: RawBodyRequest, res: Response) => {
     const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
-    const auth = authenticateGatewayRequest(req.headers, rawBody);
+    const auth = await authenticateGatewayRequest(req.headers, rawBody);
     if (!auth.ok || !auth.key || !auth.authMethod) {
       res.status(auth.statusCode).json({
         error: { message: auth.error || 'Unauthorized', type: 'authentication_error' },
@@ -293,33 +358,53 @@ async function startServer(): Promise<void> {
     }
 
     const rawData = result.body.data as Record<string, unknown> | undefined;
-    let assistantText = '';
-    if (typeof rawData?.output === 'string') {
-      assistantText = rawData.output;
-    } else if (
-      Array.isArray(rawData?.choices) &&
-      rawData.choices[0] &&
-      typeof (rawData.choices[0] as { message?: { content?: unknown } })?.message
-        ?.content === 'string'
-    ) {
-      assistantText = (
-        rawData.choices[0] as { message: { content: string } }
-      ).message.content;
-    } else if (
-      Array.isArray(rawData?.content) &&
-      rawData.content[0] &&
-      typeof (rawData.content[0] as { text?: unknown })?.text === 'string'
-    ) {
-      assistantText = (rawData.content[0] as { text: string }).text;
-    } else {
-      assistantText = JSON.stringify(rawData ?? {});
+    const assistantText = extractAssistantTextFromGatewayData(rawData);
+    const createdTs = Math.floor(Date.now() / 1000);
+    const resolvedModel = result.body.provider?.model || 'taygos-unified';
+
+    if (payload.stream === true) {
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      const chunk1 = {
+        id: result.body.requestId,
+        object: 'chat.completion.chunk',
+        created: createdTs,
+        model: resolvedModel,
+        choices: [
+          {
+            index: 0,
+            delta: { role: 'assistant', content: assistantText },
+            finish_reason: null,
+          },
+        ],
+      };
+      const chunk2 = {
+        id: result.body.requestId,
+        object: 'chat.completion.chunk',
+        created: createdTs,
+        model: resolvedModel,
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: 'stop',
+          },
+        ],
+      };
+      res.write(`data: ${JSON.stringify(chunk1)}\n\n`);
+      res.write(`data: ${JSON.stringify(chunk2)}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
     }
 
     res.status(200).json({
       id: result.body.requestId,
       object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: result.body.provider?.model || 'taygos-unified',
+      created: createdTs,
+      model: resolvedModel,
       choices: [
         {
           index: 0,
@@ -330,6 +415,11 @@ async function startServer(): Promise<void> {
           finish_reason: 'stop',
         },
       ],
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      },
       taygos: {
         requestId: result.body.requestId,
         provider: result.body.provider,
@@ -340,10 +430,67 @@ async function startServer(): Promise<void> {
     });
   });
 
+  // Anthropic-Compatible Messages Endpoint (for Claude Code CLI & Anthropic SDKs)
+  app.post('/api/v1/messages', async (req: RawBodyRequest, res: Response) => {
+    const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
+    const auth = await authenticateGatewayRequest(req.headers, rawBody);
+    if (!auth.ok || !auth.key || !auth.authMethod) {
+      res.status(auth.statusCode).json({
+        type: 'error',
+        error: {
+          type: 'authentication_error',
+          message: auth.error || 'Unauthorized',
+        },
+      });
+      return;
+    }
+
+    const payload =
+      req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+        ? (req.body as Record<string, unknown>)
+        : {};
+
+    const result = await executeUnifiedGateway({
+      key: auth.key,
+      authMethod: auth.authMethod,
+      payload,
+      category: 'llm',
+      allowSandbox: false,
+    });
+
+    if (!result.body.ok) {
+      res.status(result.httpStatus).json({
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: result.body.error || 'Upstream failover exhausted.',
+        },
+      });
+      return;
+    }
+
+    const rawData = result.body.data as Record<string, unknown> | undefined;
+    const assistantText = extractAssistantTextFromGatewayData(rawData);
+
+    res.status(200).json({
+      id: result.body.requestId,
+      type: 'message',
+      role: 'assistant',
+      model: result.body.provider?.model || 'taygos-unified',
+      content: [{ type: 'text', text: assistantText }],
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+      },
+    });
+  });
+
   // Unified Image & Product Background Generation Endpoint (OpenAI Images Compatible)
   app.post('/api/v1/images/generations', async (req: RawBodyRequest, res: Response) => {
     const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
-    const auth = authenticateGatewayRequest(req.headers, rawBody);
+    const auth = await authenticateGatewayRequest(req.headers, rawBody);
     if (!auth.ok || !auth.key || !auth.authMethod) {
       res.status(auth.statusCode).json({
         error: { message: auth.error || 'Unauthorized', type: 'authentication_error' },
@@ -367,7 +514,7 @@ async function startServer(): Promise<void> {
   // Unified Video Generation & Stock Video Endpoint
   app.post('/api/v1/videos/generations', async (req: RawBodyRequest, res: Response) => {
     const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
-    const auth = authenticateGatewayRequest(req.headers, rawBody);
+    const auth = await authenticateGatewayRequest(req.headers, rawBody);
     if (!auth.ok || !auth.key || !auth.authMethod) {
       res.status(auth.statusCode).json({
         error: { message: auth.error || 'Unauthorized', type: 'authentication_error' },
@@ -391,7 +538,7 @@ async function startServer(): Promise<void> {
   // Unified Audio Text-to-Speech (TTS) Endpoint (OpenAI Audio Speech Compatible)
   app.post('/api/v1/audio/speech', async (req: RawBodyRequest, res: Response) => {
     const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
-    const auth = authenticateGatewayRequest(req.headers, rawBody);
+    const auth = await authenticateGatewayRequest(req.headers, rawBody);
     if (!auth.ok || !auth.key || !auth.authMethod) {
       res.status(auth.statusCode).json({
         error: { message: auth.error || 'Unauthorized', type: 'authentication_error' },
@@ -421,7 +568,7 @@ async function startServer(): Promise<void> {
   // Unified Audio Speech-to-Text (STT / Whisper) Endpoint
   app.post('/api/v1/audio/transcriptions', async (req: RawBodyRequest, res: Response) => {
     const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
-    const auth = authenticateGatewayRequest(req.headers, rawBody);
+    const auth = await authenticateGatewayRequest(req.headers, rawBody);
     if (!auth.ok || !auth.key || !auth.authMethod) {
       res.status(auth.statusCode).json({
         error: { message: auth.error || 'Unauthorized', type: 'authentication_error' },
@@ -445,7 +592,7 @@ async function startServer(): Promise<void> {
   // Unified Zero-Dependency Storyboard & Printable PDF-Ready Endpoint
   app.post('/api/v1/documents/storyboard', async (req: RawBodyRequest, res: Response) => {
     const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
-    const auth = authenticateGatewayRequest(req.headers, rawBody);
+    const auth = await authenticateGatewayRequest(req.headers, rawBody);
     if (!auth.ok || !auth.key || !auth.authMethod) {
       res.status(auth.statusCode).json({
         error: { message: auth.error || 'Unauthorized', type: 'authentication_error' },
@@ -537,7 +684,7 @@ async function startServer(): Promise<void> {
   // Companion Unified PDF / Document HTML Render Endpoint
   app.post('/api/v1/documents/pdf', async (req: RawBodyRequest, res: Response) => {
     const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
-    const auth = authenticateGatewayRequest(req.headers, rawBody);
+    const auth = await authenticateGatewayRequest(req.headers, rawBody);
     if (!auth.ok || !auth.key || !auth.authMethod) {
       res.status(auth.statusCode).json({
         error: { message: auth.error || 'Unauthorized', type: 'authentication_error' },
@@ -558,8 +705,8 @@ async function startServer(): Promise<void> {
     res.status(result.httpStatus).json(result.body);
   });
 
-  app.get('/api/v1/status', (req: RawBodyRequest, res: Response) => {
-    const auth = authenticateGatewayRequest(req.headers, '');
+  app.get('/api/v1/status', async (req: RawBodyRequest, res: Response) => {
+    const auth = await authenticateGatewayRequest(req.headers, '');
     if (!auth.ok || !auth.key) {
       res.status(auth.statusCode).json({ ok: false, error: auth.error });
       return;
@@ -585,6 +732,7 @@ async function startServer(): Promise<void> {
 
   // Admin Authentication Routes
   app.get('/api/admin/auth/status', async (req, res) => {
+    await ensureDbHydrated();
     const token = extractBearerToken(req);
     const authenticated =
       verifyAdminSessionToken(token) || Boolean(await verifyFirebaseAdminBearer(token));
@@ -596,7 +744,8 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.post('/api/admin/auth/claim', (req, res) => {
+  app.post('/api/admin/auth/claim', async (req, res) => {
+    await ensureDbHydrated();
     if (!isAdminSetupRequired()) {
       res.status(409).json({ error: 'Admin passcode is already configured.' });
       return;
@@ -612,11 +761,13 @@ async function startServer(): Promise<void> {
       res.status(409).json({ error: 'Admin passcode is already claimed.' });
       return;
     }
+    await persistSettingsRecord();
     const token = createAdminSessionToken();
     res.status(201).json({ token });
   });
 
-  app.post('/api/admin/auth/login', (req, res) => {
+  app.post('/api/admin/auth/login', async (req, res) => {
+    await ensureDbHydrated();
     if (isAdminSetupRequired()) {
       res.status(400).json({ error: 'Initial admin setup is required first.' });
       return;
@@ -693,11 +844,12 @@ async function startServer(): Promise<void> {
       gatewayEndpointUrl: `${getBaseOrigin(req)}/api/v1/gateway`,
       hasMasterEncryptionKey: hasPersistentMasterKey(),
       hasGeminiEnvKey: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      bootId: SERVER_BOOT_ID,
     });
   });
 
   // Access Keys CRUD
-  app.post('/api/admin/keys', requireAdminAuth, (req, res) => {
+  app.post('/api/admin/keys', requireAdminAuth, async (req, res) => {
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     if (!name || name.length > 80) {
       res.status(400).json({ error: 'Key name is required (max 80 chars).' });
@@ -720,6 +872,7 @@ async function startServer(): Promise<void> {
       scopes,
       requireHmac,
     });
+    await persistKeyRecord(stored);
 
     res.status(201).json({
       key: toPublicKeyView(stored),
@@ -727,7 +880,7 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.patch('/api/admin/keys/:id', requireAdminAuth, (req, res) => {
+  app.patch('/api/admin/keys/:id', requireAdminAuth, async (req, res) => {
     const store = getStore();
     const target = store.keys.find((k) => k.id === req.params.id);
     if (!target) {
@@ -746,16 +899,17 @@ async function startServer(): Promise<void> {
     if (typeof req.body?.requireHmac === 'boolean') {
       target.requireHmac = req.body.requireHmac;
     }
-    persistStore();
+    await persistKeyRecord(target);
     res.json({ key: toPublicKeyView(target) });
   });
 
-  app.post('/api/admin/keys/:id/rotate', requireAdminAuth, (req, res) => {
+  app.post('/api/admin/keys/:id/rotate', requireAdminAuth, async (req, res) => {
     const rotated = rotateAccessKeySecret(String(req.params.id));
     if (!rotated) {
       res.status(404).json({ error: 'API key not found.' });
       return;
     }
+    await persistKeyRecord(rotated.stored);
     res.json({
       key: toPublicKeyView(rotated.stored),
       secretKey: rotated.plainSecret,
@@ -780,15 +934,12 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.delete('/api/admin/keys/:id', requireAdminAuth, (req, res) => {
-    const store = getStore();
-    const before = store.keys.length;
-    store.keys = store.keys.filter((k) => k.id !== req.params.id);
-    if (store.keys.length === before) {
+  app.delete('/api/admin/keys/:id', requireAdminAuth, async (req, res) => {
+    const removed = await deleteKeyRecord(String(req.params.id));
+    if (!removed) {
       res.status(404).json({ error: 'API key not found.' });
       return;
     }
-    persistStore();
     res.json({ ok: true });
   });
 
@@ -874,6 +1025,7 @@ async function startServer(): Promise<void> {
         : 'healthy') as SimulatorBehavior,
     });
 
+    await persistProviderRecord(provider);
     res.status(201).json({ provider: toPublicProviderView(provider) });
   });
 
@@ -970,6 +1122,7 @@ async function startServer(): Promise<void> {
           : 8000,
         simulatorBehavior: 'healthy',
       });
+      await persistProviderRecord(provider);
       created.push(toPublicProviderView(provider));
     }
 
@@ -1239,6 +1392,7 @@ async function startServer(): Promise<void> {
           freeModelsCount: item.freeModelsCount,
         });
         existingKeys.add(dedupeKey);
+        await persistProviderRecord(provider);
         created.push(toPublicProviderView(provider));
       } catch {
         skipped += 1;
@@ -1320,7 +1474,7 @@ async function startServer(): Promise<void> {
     }
 
     store.providers.sort((a, b) => a.priority - b.priority);
-    persistStore();
+    await persistProviderRecord(target);
     res.json({ provider: toPublicProviderView(target) });
   });
 
@@ -1362,20 +1516,17 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.delete('/api/admin/providers/:id', requireAdminAuth, (req, res) => {
-    const store = getStore();
-    const before = store.providers.length;
-    store.providers = store.providers.filter((p) => p.id !== req.params.id);
-    if (store.providers.length === before) {
+  app.delete('/api/admin/providers/:id', requireAdminAuth, async (req, res) => {
+    const removed = await deleteProviderRecord(String(req.params.id));
+    if (!removed) {
       res.status(404).json({ error: 'Provider not found.' });
       return;
     }
-    persistStore();
     res.json({ ok: true });
   });
 
   // Routing Policy
-  app.put('/api/admin/routing', requireAdminAuth, (req, res) => {
+  app.put('/api/admin/routing', requireAdminAuth, async (req, res) => {
     const store = getStore();
     const strategy = req.body?.strategy as RoutingStrategy;
     if (['priority_failover', 'round_robin', 'lowest_latency'].includes(strategy)) {
@@ -1396,15 +1547,13 @@ async function startServer(): Promise<void> {
         Math.min(600, Math.round(req.body.cooldownSeconds))
       );
     }
-    persistStore();
+    await persistSettingsRecord();
     res.json({ routing: store.routing });
   });
 
   // Logs clear
-  app.delete('/api/admin/logs', requireAdminAuth, (_req, res) => {
-    const store = getStore();
-    store.logs = [];
-    persistStore();
+  app.delete('/api/admin/logs', requireAdminAuth, async (_req, res) => {
+    await clearGatewayLogsRecord();
     res.json({ ok: true });
   });
 
@@ -1432,7 +1581,8 @@ async function startServer(): Promise<void> {
     next();
   });
 
-  app.get('/api/studio/session', (req: Request, res: Response) => {
+  app.get('/api/studio/session', async (req: Request, res: Response) => {
+    await ensureDbHydrated();
     const studioToken = createStudioBridgeToken(60 * 60 * 24);
     const origin = getBaseOrigin(req);
     res.json({
@@ -1448,6 +1598,7 @@ async function startServer(): Promise<void> {
   async function resolveStudioCaller(
     req: RawBodyRequest
   ): Promise<{ key: StoredAccessKey; authMethod: 'key_pair' | 'hmac_sha256' | 'bearer_pair' } | null> {
+    await ensureDbHydrated();
     const token = extractBearerToken(req);
     const studioHeaderToken =
       typeof req.headers['x-studio-token'] === 'string'
@@ -1483,7 +1634,7 @@ async function startServer(): Promise<void> {
     }
 
     const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
-    const gwAuth = authenticateGatewayRequest(req.headers, rawBody);
+    const gwAuth = await authenticateGatewayRequest(req.headers, rawBody);
     if (gwAuth.ok && gwAuth.key && gwAuth.authMethod) {
       return { key: gwAuth.key, authMethod: gwAuth.authMethod };
     }

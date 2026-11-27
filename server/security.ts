@@ -1,16 +1,77 @@
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
+import fs from 'node:fs';
 import net from 'node:net';
+import path from 'node:path';
 
-const EPHEMERAL_SESSION_SECRET = crypto.randomBytes(32);
-const EPHEMERAL_VAULT_SECRET = crypto.randomBytes(32);
+const DATA_DIR = path.resolve(process.cwd(), 'data');
+const LOCAL_VAULT_KEY_PATH = path.join(DATA_DIR, '.vault-master-key');
+const LOCAL_SESSION_KEY_PATH = path.join(DATA_DIR, '.vault-session-key');
+
+let cachedLocalSessionSecret: Buffer | null = null;
+let cachedLocalVaultSecret: Buffer | null = null;
+let dbBackedVaultActive = false;
+
+function loadOrCreateLocalSecret(filePath: string): Buffer {
+  try {
+    if (fs.existsSync(filePath)) {
+      const hex = fs.readFileSync(filePath, 'utf8').trim();
+      if (/^[0-9a-f]{64}$/i.test(hex)) {
+        return Buffer.from(hex, 'hex');
+      }
+    }
+    const generated = crypto.randomBytes(32);
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(filePath, generated.toString('hex'), {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    return generated;
+  } catch {
+    return crypto.randomBytes(32);
+  }
+}
+
+export function getLocalVaultSecretsHex(): {
+  vaultMasterKeyHex: string;
+  vaultSessionKeyHex: string;
+} {
+  if (!cachedLocalVaultSecret) {
+    cachedLocalVaultSecret = loadOrCreateLocalSecret(LOCAL_VAULT_KEY_PATH);
+  }
+  if (!cachedLocalSessionSecret) {
+    cachedLocalSessionSecret = loadOrCreateLocalSecret(LOCAL_SESSION_KEY_PATH);
+  }
+  return {
+    vaultMasterKeyHex: cachedLocalVaultSecret.toString('hex'),
+    vaultSessionKeyHex: cachedLocalSessionSecret.toString('hex'),
+  };
+}
+
+export function setRuntimeVaultSecrets(input: {
+  vaultMasterKeyHex?: string | null;
+  vaultSessionKeyHex?: string | null;
+}): void {
+  if (input.vaultMasterKeyHex && /^[0-9a-f]{64}$/i.test(input.vaultMasterKeyHex.trim())) {
+    cachedLocalVaultSecret = Buffer.from(input.vaultMasterKeyHex.trim(), 'hex');
+    dbBackedVaultActive = true;
+  }
+  if (input.vaultSessionKeyHex && /^[0-9a-f]{64}$/i.test(input.vaultSessionKeyHex.trim())) {
+    cachedLocalSessionSecret = Buffer.from(input.vaultSessionKeyHex.trim(), 'hex');
+  }
+}
 
 function getSessionSecret(): Buffer {
   const envSecret = process.env.TAYGOS_SESSION_SECRET?.trim();
   if (envSecret && envSecret.length >= 16) {
     return crypto.createHash('sha256').update(envSecret).digest();
   }
-  return EPHEMERAL_SESSION_SECRET;
+  if (!cachedLocalSessionSecret) {
+    cachedLocalSessionSecret = loadOrCreateLocalSecret(LOCAL_SESSION_KEY_PATH);
+  }
+  return cachedLocalSessionSecret;
 }
 
 function getVaultKey(): { key: Buffer; persistent: boolean } {
@@ -19,11 +80,14 @@ function getVaultKey(): { key: Buffer; persistent: boolean } {
     const derived = crypto.scryptSync(envMaster, 'taygos-vault-salt-v1', 32);
     return { key: derived, persistent: true };
   }
-  return { key: EPHEMERAL_VAULT_SECRET, persistent: false };
+  if (!cachedLocalVaultSecret) {
+    cachedLocalVaultSecret = loadOrCreateLocalSecret(LOCAL_VAULT_KEY_PATH);
+  }
+  return { key: cachedLocalVaultSecret, persistent: dbBackedVaultActive };
 }
 
 export function hasPersistentMasterKey(): boolean {
-  return Boolean(process.env.TAYGOS_MASTER_KEY?.trim());
+  return Boolean(process.env.TAYGOS_MASTER_KEY?.trim()) || dbBackedVaultActive;
 }
 
 export function hashSecret(plain: string): string {

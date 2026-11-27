@@ -14,6 +14,17 @@ import type {
 } from '../src/types/taygos.ts';
 import { TAYGOS_GITHUB_CATALOG } from './catalog.ts';
 import {
+  appendLogToDb,
+  clearLogsInDb,
+  deleteKeyFromDb,
+  deleteProviderFromDb,
+  hydrateStoreFromDb,
+  saveFullStoreToDb,
+  saveSettingsToDb,
+  upsertKeyToDb,
+  upsertProviderToDb,
+} from './dbVault.ts';
+import {
   assertSafeUpstreamUrl,
   generateTaygosKeyPair,
   hashSecret,
@@ -470,8 +481,7 @@ function ensureStoreLoaded(): StoreSchema {
   return memoryStore;
 }
 
-export function persistStore(): void {
-  const store = ensureStoreLoaded();
+function persistLocalStoreFile(store: StoreSchema): void {
   try {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -484,8 +494,95 @@ export function persistStore(): void {
   }
 }
 
+export function persistStore(): void {
+  const store = ensureStoreLoaded();
+  persistLocalStoreFile(store);
+}
+
 export function getStore(): StoreSchema {
   return ensureStoreLoaded();
+}
+
+const DB_REFRESH_TTL_MS = 15_000;
+let lastDbSyncAt = 0;
+let inFlightHydration: Promise<StoreSchema> | null = null;
+
+export async function ensureDbHydrated(forceRefresh = false): Promise<StoreSchema> {
+  const store = ensureStoreLoaded();
+  if (
+    !forceRefresh &&
+    lastDbSyncAt > 0 &&
+    Date.now() - lastDbSyncAt < DB_REFRESH_TTL_MS
+  ) {
+    return store;
+  }
+  if (inFlightHydration) {
+    return inFlightHydration;
+  }
+  inFlightHydration = (async () => {
+    try {
+      const res = await hydrateStoreFromDb(store, mergeMissingCatalogProviders);
+      if (res.hydrated) {
+        lastDbSyncAt = Date.now();
+        persistLocalStoreFile(store);
+      }
+    } catch (err) {
+      console.error('Database hydration error:', err);
+    } finally {
+      inFlightHydration = null;
+    }
+    return store;
+  })();
+  return inFlightHydration;
+}
+
+export async function persistKeyRecord(k: StoredAccessKey): Promise<void> {
+  persistStore();
+  await upsertKeyToDb(k).catch((err) => console.error('DB key sync error:', err));
+}
+
+export async function deleteKeyRecord(keyId: string): Promise<boolean> {
+  const store = ensureStoreLoaded();
+  const before = store.keys.length;
+  store.keys = store.keys.filter((k) => k.id !== keyId);
+  if (store.keys.length === before) return false;
+  persistLocalStoreFile(store);
+  await deleteKeyFromDb(keyId).catch((err) => console.error('DB key delete error:', err));
+  return true;
+}
+
+export async function persistProviderRecord(p: StoredUpstreamProvider): Promise<void> {
+  persistStore();
+  await upsertProviderToDb(p).catch((err) =>
+    console.error('DB provider sync error:', err)
+  );
+}
+
+export async function deleteProviderRecord(providerId: string): Promise<boolean> {
+  const store = ensureStoreLoaded();
+  const before = store.providers.length;
+  store.providers = store.providers.filter((p) => p.id !== providerId);
+  if (store.providers.length === before) return false;
+  persistLocalStoreFile(store);
+  await deleteProviderFromDb(providerId).catch((err) =>
+    console.error('DB provider delete error:', err)
+  );
+  return true;
+}
+
+export async function persistSettingsRecord(): Promise<void> {
+  const store = ensureStoreLoaded();
+  persistLocalStoreFile(store);
+  await saveSettingsToDb(store).catch((err) =>
+    console.error('DB settings sync error:', err)
+  );
+}
+
+export async function clearGatewayLogsRecord(): Promise<void> {
+  const store = ensureStoreLoaded();
+  store.logs = [];
+  persistLocalStoreFile(store);
+  await clearLogsInDb().catch((err) => console.error('DB logs clear error:', err));
 }
 
 export function isEnvPasscodeConfigured(): boolean {
@@ -504,6 +601,7 @@ export function claimInitialAdminPassword(password: string): boolean {
   }
   store.adminPasswordHash = hashSecret(password);
   persistStore();
+  void saveSettingsToDb(store).catch(() => {});
   return true;
 }
 
@@ -608,6 +706,7 @@ export function createAccessKeyRecord(input: {
   };
   store.keys.unshift(stored);
   persistStore();
+  void upsertKeyToDb(stored).catch(() => {});
   return { stored, plainSecret: secretKey };
 }
 
@@ -635,6 +734,7 @@ export function rotateAccessKeySecret(
   target.hmacSealedSecret = sealSecret(plainSecret);
   target.status = 'active';
   persistStore();
+  void upsertKeyToDb(target).catch(() => {});
   return { stored: target, plainSecret };
 }
 
@@ -714,6 +814,7 @@ export function addUpstreamProviderRecord(input: {
   store.providers.push(provider);
   store.providers.sort((a, b) => a.priority - b.priority);
   persistStore();
+  void upsertProviderToDb(provider).catch(() => {});
   return provider;
 }
 
@@ -724,6 +825,7 @@ export function appendGatewayLog(entry: GatewayLogEntry): void {
     store.logs = store.logs.slice(0, 150);
   }
   persistStore();
+  void appendLogToDb(entry).catch(() => {});
 }
 
 export interface CloudSyncKeyInput {
@@ -762,7 +864,7 @@ export async function syncCloudVaultToStore(input: {
   providers?: CloudSyncProviderInput[];
   routing?: Partial<RoutingConfig> | null;
 }): Promise<{ syncedKeys: number; syncedProviders: number }> {
-  const store = ensureStoreLoaded();
+  const store = await ensureDbHydrated(true);
   let syncedKeys = 0;
   let syncedProviders = 0;
 
@@ -941,7 +1043,13 @@ export async function syncCloudVaultToStore(input: {
   }
 
   mergeMissingCatalogProviders(store);
-  persistStore();
+  persistLocalStoreFile(store);
+  try {
+    await saveFullStoreToDb(store);
+    lastDbSyncAt = Date.now();
+  } catch (err) {
+    console.error('Failed to persist CloudVault sync to database:', err);
+  }
   return { syncedKeys, syncedProviders };
 }
 

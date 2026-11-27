@@ -12,8 +12,10 @@ import {
   verifyHmacSignature,
   verifySecret,
 } from './security.ts';
+import { recordKeyUsageInDb, recordProviderStatsInDb } from './dbVault.ts';
 import {
   appendGatewayLog,
+  ensureDbHydrated,
   getStore,
   persistStore,
   type StoredAccessKey,
@@ -28,49 +30,114 @@ export interface GatewayAuthResult {
   authMethod?: 'key_pair' | 'hmac_sha256' | 'bearer_pair';
 }
 
-export function authenticateGatewayRequest(
+function matchKeyBySecret(
+  keys: StoredAccessKey[],
+  secretKey: string
+): StoredAccessKey | undefined {
+  for (const k of keys) {
+    const unsealed = unsealSecret(k.hmacSealedSecret);
+    if (unsealed && unsealed === secretKey) {
+      return k;
+    }
+  }
+  for (const k of keys) {
+    if (verifySecret(secretKey, k.secretHash)) {
+      return k;
+    }
+  }
+  return undefined;
+}
+
+export async function authenticateGatewayRequest(
   headers: Record<string, string | string[] | undefined>,
   rawBody: string
-): GatewayAuthResult {
+): Promise<GatewayAuthResult> {
   const getHeader = (name: string): string => {
     const val = headers[name.toLowerCase()];
     if (Array.isArray(val)) return val[0]?.trim() ?? '';
     return typeof val === 'string' ? val.trim() : '';
   };
 
-  let publicKey = getHeader('x-taygos-public-key');
-  let secretKey = getHeader('x-taygos-secret-key');
+  const cleanCred = (s: string): string =>
+    s.trim().replace(/^["']+|["']+$/g, '').trim();
+
+  let publicKey = cleanCred(getHeader('x-taygos-public-key'));
+  let secretKey = cleanCred(getHeader('x-taygos-secret-key'));
   const timestamp = getHeader('x-taygos-timestamp');
   const signature = getHeader('x-taygos-signature');
   const authHeader = getHeader('authorization');
+  const altApiKeyHeader = cleanCred(
+    getHeader('x-api-key') || getHeader('x-taygos-api-key')
+  );
 
   let authMethod: 'key_pair' | 'hmac_sha256' | 'bearer_pair' | null = null;
 
-  if (!publicKey && authHeader.toLowerCase().startsWith('bearer ')) {
-    const token = authHeader.slice(7).trim();
-    const colonIdx = token.indexOf(':');
-    if (colonIdx > 0) {
-      publicKey = token.slice(0, colonIdx).trim();
-      secretKey = token.slice(colonIdx + 1).trim();
+  const parseCombinedToken = (rawToken: string) => {
+    const token = cleanCred(rawToken);
+    if (!token) return;
+    const sepIdx = token.indexOf(':') > 0 ? token.indexOf(':') : token.indexOf('|');
+    if (sepIdx > 0) {
+      if (!publicKey) publicKey = cleanCred(token.slice(0, sepIdx));
+      if (!secretKey) secretKey = cleanCred(token.slice(sepIdx + 1));
+      authMethod = 'bearer_pair';
+    } else if (!secretKey) {
+      secretKey = token;
       authMethod = 'bearer_pair';
     }
+  };
+
+  if (authHeader.toLowerCase().startsWith('bearer ')) {
+    parseCombinedToken(authHeader.slice(7));
+  } else if (!secretKey && altApiKeyHeader) {
+    parseCombinedToken(altApiKeyHeader);
   }
 
-  if (!publicKey) {
+  if (!publicKey && !secretKey) {
     return {
       ok: false,
       statusCode: 401,
-      error: 'Missing X-Taygos-Public-Key header or Bearer pk:sk credential.',
+      error: 'Missing X-Taygos-Public-Key or Authorization Bearer credential.',
     };
   }
 
-  const store = getStore();
-  const key = store.keys.find((k) => k.publicKey === publicKey);
+  let store = await ensureDbHydrated();
+  let key: StoredAccessKey | undefined;
+  let matchedBySecretDirectly = false;
+
+  if (publicKey) {
+    key = store.keys.find((k) => k.publicKey === publicKey);
+    if (!key) {
+      store = await ensureDbHydrated(true);
+      key = store.keys.find((k) => k.publicKey === publicKey);
+    }
+    if (!key) {
+      return {
+        ok: false,
+        statusCode: 401,
+        error: 'Invalid Taygos Public Key.',
+      };
+    }
+  } else if (secretKey) {
+    key = matchKeyBySecret(store.keys, secretKey);
+    if (!key) {
+      store = await ensureDbHydrated(true);
+      key = matchKeyBySecret(store.keys, secretKey);
+    }
+    if (!key) {
+      return {
+        ok: false,
+        statusCode: 401,
+        error: 'Invalid Taygos Secret Key.',
+      };
+    }
+    matchedBySecretDirectly = true;
+  }
+
   if (!key) {
     return {
       ok: false,
       statusCode: 401,
-      error: 'Invalid Taygos Public Key.',
+      error: 'Invalid Taygos credentials.',
     };
   }
 
@@ -130,7 +197,7 @@ export function authenticateGatewayRequest(
         error: 'Missing X-Taygos-Secret-Key header.',
       };
     }
-    if (!verifySecret(secretKey, key.secretHash)) {
+    if (!matchedBySecretDirectly && !verifySecret(secretKey, key.secretHash)) {
       return {
         ok: false,
         statusCode: 401,
@@ -1927,6 +1994,7 @@ export async function probeUpstreamProvider(
         ? latencyMs
         : Math.round(provider.avgLatencyMs * 0.7 + latencyMs * 0.3);
     persistStore();
+    void recordProviderStatsInDb(provider).catch(() => {});
     return { ok: true, statusCode: 200, latencyMs, message: 'Operational' };
   } catch (err) {
     const latencyMs = Math.max(1, Date.now() - start);
@@ -1939,6 +2007,7 @@ export async function probeUpstreamProvider(
     provider.lastError = message;
     provider.lastCheckedAt = new Date().toISOString();
     persistStore();
+    void recordProviderStatsInDb(provider).catch(() => {});
     return { ok: false, statusCode, latencyMs, message };
   }
 }
@@ -2080,7 +2149,7 @@ export async function executeUnifiedGateway(params: {
   allowSandbox?: boolean;
   fullCascade?: boolean;
 }): Promise<{ httpStatus: number; body: GatewayExecutionResponse }> {
-  const store = getStore();
+  const store = await ensureDbHydrated();
   const requestId = `req_${crypto.randomBytes(8).toString('hex')}`;
   const startAll = Date.now();
   const { candidates, skippedAttempts } = selectOrderedCandidates(
@@ -2168,6 +2237,8 @@ export async function executeUnifiedGateway(params: {
         params.key.failoverCount += 1;
       }
       persistStore();
+      void recordKeyUsageInDb(params.key).catch(() => {});
+      void recordProviderStatsInDb(provider).catch(() => {});
 
       const totalLatencyMs = Math.max(1, Date.now() - startAll);
       appendGatewayLog({
@@ -2238,12 +2309,14 @@ export async function executeUnifiedGateway(params: {
         outcome: 'failed',
         errorMessage: errMsg,
       });
+      void recordProviderStatsInDb(provider).catch(() => {});
     }
   }
 
   params.key.requestCount += 1;
   params.key.lastUsedAt = new Date().toISOString();
   persistStore();
+  void recordKeyUsageInDb(params.key).catch(() => {});
 
   const totalLatencyMs = Math.max(1, Date.now() - startAll);
   appendGatewayLog({
